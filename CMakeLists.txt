@@ -56,6 +56,8 @@ find_package(Threads REQUIRED)
 
 # ---- Core library ----
 add_library(infer_core STATIC
+    src/net/http.cpp
+    src/net/http_server.cpp
     src/runtime/onnx_backend.cpp
 )
 target_include_directories(infer_core PUBLIC include)
@@ -67,3 +69,27 @@ endif()
 # ---- Executables ----
 add_executable(ort_smoke apps/ort_smoke.cpp)
 target_link_libraries(ort_smoke PRIVATE infer_core)
+
+add_executable(inference_server apps/server_main.cpp)
+target_link_libraries(inference_server PRIVATE infer_core)
+
+# ---- Tests ----
+option(INFER_BUILD_TESTS "Build unit tests (fetches GoogleTest)" ON)
+if(INFER_BUILD_TESTS)
+    include(FetchContent)
+    FetchContent_Declare(googletest
+        URL https://github.com/google/googletest/archive/refs/tags/v1.17.0.tar.gz)
+    set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(googletest)
+
+    enable_testing()
+    add_executable(unit_tests
+        tests/http_parser_test.cpp
+        tests/http_server_test.cpp
+    )
+    target_link_libraries(unit_tests PRIVATE infer_core GTest::gtest_main)
+    include(GoogleTest)
+    # PRE_TEST: list tests when ctest runs, not at build time (sanitized
+    # binaries may need a special launcher, e.g. `setarch -R` for TSan).
+    gtest_discover_tests(unit_tests DISCOVERY_MODE PRE_TEST)
+endif()
