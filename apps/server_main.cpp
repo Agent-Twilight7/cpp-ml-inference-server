@@ -18,6 +18,7 @@
 //                    (3x224x224 for ResNet-18) -> JSON top-5 classes
 
 #include "infer/batching/dynamic_batcher.hpp"
+#include "infer/memory/block_pool.hpp"
 #include "infer/net/http_server.hpp"
 #include "infer/runtime/onnx_backend.hpp"
 
@@ -30,6 +31,7 @@
 #include <exception>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -47,6 +49,7 @@ struct Config {
     std::size_t queue_size = 1024;
     long queue_timeout_ms = 0;
     std::string buckets = "auto";  // "auto", "none", or e.g. "1,2,4,8,16"
+    bool pinned = true;            // CUDA pinned batch buffers
 };
 
 // Resolves --buckets. "auto" means power-of-two buckets on CUDA (where shape
@@ -81,7 +84,7 @@ std::string join(const std::vector<std::size_t>& v) {
     std::fprintf(stderr,
                  "usage: %s [--model PATH] [--device cpu|cuda] [--port N] [--reactors N] [--workers N]\n"
                  "          [--ort-threads N] [--max-batch N] [--max-delay-us N] [--queue-size N]\n"
-                 "          [--queue-timeout-ms N] [--buckets auto|none|N,N,...]\n",
+                 "          [--queue-timeout-ms N] [--buckets auto|none|N,N,...] [--pinned 0|1]\n",
                  argv0);
     std::exit(2);
 }
@@ -115,6 +118,8 @@ Config parse_args(int argc, char** argv) {
             cfg.queue_timeout_ms = std::stol(value);
         } else if (flag == "--buckets") {
             cfg.buckets = value;
+        } else if (flag == "--pinned") {
+            cfg.pinned = value != "0";
         } else {
             usage(argv[0]);
         }
@@ -184,7 +189,11 @@ int main(int argc, char** argv) {
         const infer::OnnxBackendOptions backend_opts{.model_path = cfg.model,
                                                      .device = cfg.device,
                                                      .intra_op_threads = cfg.ort_threads,
-                                                     .batch_buckets = buckets};
+                                                     .batch_buckets = buckets,
+                                                     .pinned_host_memory = cfg.pinned};
+        // Declared before the batcher so it outlives it: queued requests hold
+        // its blocks. Created once the batcher knows the input size.
+        std::optional<infer::BlockPool> request_pool;
         infer::DynamicBatcher batcher(
             infer::BatcherOptions{
                 .max_batch_size = cfg.max_batch,
@@ -197,13 +206,19 @@ int main(int argc, char** argv) {
         batcher.start();  // includes warm-up
         const std::size_t in_n = batcher.input_elems();
 
+        // Request input buffers: enough for a full queue plus the batches being
+        // gathered. An empty pool means overload (503), so this also caps the
+        // memory requests can pin down. Untouched blocks cost no physical memory.
+        request_pool.emplace(in_n, cfg.queue_size + static_cast<std::size_t>(cfg.workers) * cfg.max_batch);
+
         infer::net::HttpServer server({.port = cfg.port, .num_reactors = cfg.reactors});
 
         server.route("GET", "/health", [](infer::net::HttpRequest&&, infer::net::Responder r) {
             r.send(infer::net::HttpResponse::text(200, "ok\n"));
         });
 
-        server.route("POST", "/v1/infer", [&batcher, in_n](infer::net::HttpRequest&& req, infer::net::Responder r) {
+        server.route("POST", "/v1/infer", [&batcher, &request_pool, in_n](infer::net::HttpRequest&& req,
+                                                                          infer::net::Responder r) {
             const std::size_t want = in_n * sizeof(float);
             if (req.body.size() != want) {
                 r.send(infer::net::HttpResponse::text(
@@ -211,8 +226,13 @@ int main(int argc, char** argv) {
                              " float32), got " + std::to_string(req.body.size()) + "\n"));
                 return;
             }
-            // Copy out of the string so the floats are properly aligned.
-            std::vector<float> input(in_n);
+            // The one copy of the input: from the connection's receive buffer
+            // into a preallocated, aligned pool block. No allocation.
+            infer::BlockPool::Block input = request_pool->try_acquire();
+            if (!input) {
+                r.send(infer::net::HttpResponse::text(503, "server overloaded, retry later\n"));
+                return;
+            }
             std::memcpy(input.data(), req.body.data(), want);
 
             const bool accepted = batcher.submit(std::move(input), [r](const infer::InferResult& res) {

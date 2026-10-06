@@ -43,8 +43,10 @@ DynamicBatcher::DynamicBatcher(BatcherOptions opts, const BackendFactory& make_b
         }
         // Room for the largest batch after the backend pads it.
         const std::size_t capacity = w->backend->padded_batch_size(opts_.max_batch_size);
-        w->batch_in.resize(capacity * input_elems_);
-        w->batch_out.resize(capacity * output_elems_);
+        // Allocated by the backend so a GPU backend can make them pinned memory.
+        w->batch_in = w->backend->allocate_host_buffer(capacity * input_elems_);
+        w->batch_out = w->backend->allocate_host_buffer(capacity * output_elems_);
+        std::fill_n(w->batch_in.get(), capacity * input_elems_, 0.0f);
         w->batch.reserve(opts_.max_batch_size);
         workers_.push_back(std::move(w));
     }
@@ -64,8 +66,7 @@ void DynamicBatcher::start() {
             const std::size_t n = std::min(b, opts_.max_batch_size);
             const std::size_t p = w->backend->padded_batch_size(n);
             if (p != last) {
-                w->backend->run(std::span(w->batch_in).first(p * input_elems_),
-                                std::span(w->batch_out).first(p * output_elems_), p);
+                w->backend->run(w->inputs(p, input_elems_), w->outputs(p, output_elems_), p);
                 last = p;
             }
             if (n == opts_.max_batch_size) break;
@@ -77,7 +78,7 @@ void DynamicBatcher::start() {
     }
 }
 
-bool DynamicBatcher::submit(std::vector<float>&& input, InferCallback done) {
+bool DynamicBatcher::submit(BlockPool::Block&& input, InferCallback done) {
     if (input.size() != input_elems_) throw std::invalid_argument("submit: wrong input size");
     std::size_t depth;
     {
@@ -164,9 +165,12 @@ void DynamicBatcher::run_batch(Worker& w, Clock::time_point formed) {
         if (w.batch.empty()) return;
     }
 
+    // Gather into the batch buffer, returning each request's block to the pool
+    // right away so it can take a new request while this batch computes.
     const std::size_t n = w.batch.size();
     for (std::size_t i = 0; i < n; ++i) {
-        std::memcpy(w.batch_in.data() + i * input_elems_, w.batch[i].input.data(), input_elems_ * sizeof(float));
+        std::memcpy(w.batch_in.get() + i * input_elems_, w.batch[i].input.data(), input_elems_ * sizeof(float));
+        w.batch[i].input.reset();
     }
 
     const Clock::time_point t0 = Clock::now();
@@ -174,8 +178,7 @@ void DynamicBatcher::run_batch(Worker& w, Clock::time_point formed) {
         // Rows n..padded-1 hold stale data from earlier batches; their outputs
         // are ignored, so there's no need to clear them.
         const std::size_t padded = w.backend->padded_batch_size(n);
-        w.backend->run(std::span(w.batch_in).first(padded * input_elems_),
-                       std::span(w.batch_out).first(padded * output_elems_), padded);
+        w.backend->run(w.inputs(padded, input_elems_), w.outputs(padded, output_elems_), padded);
     } catch (const std::exception& e) {
         for (auto& r : w.batch) {
             invoke_callback(r.done, InferResult{.status = InferStatus::kError, .batch_size = n, .error = e.what()});
@@ -188,7 +191,7 @@ void DynamicBatcher::run_batch(Worker& w, Clock::time_point formed) {
         const Request& r = w.batch[i];
         invoke_callback(r.done, InferResult{
                            .status = InferStatus::kOk,
-                           .output = std::span<const float>(w.batch_out).subspan(i * output_elems_, output_elems_),
+                           .output = std::span<const float>(w.batch_out.get() + i * output_elems_, output_elems_),
                            .batch_size = n,
                            .queue_time = micros_between(r.enqueued, formed),
                            .compute_time = compute,

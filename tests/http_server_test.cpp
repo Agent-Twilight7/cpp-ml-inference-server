@@ -97,7 +97,7 @@ protected:
         server_ = std::make_unique<HttpServer>(HttpServerOptions{.host = "127.0.0.1", .port = 0, .num_reactors = 2});
         server_->route("GET", "/hello", [](HttpRequest&&, Responder r) { r.send(HttpResponse::text(200, "hi")); });
         server_->route("POST", "/echo", [](HttpRequest&& req, Responder r) {
-            r.send(HttpResponse::text(200, std::move(req.body)));
+            r.send(HttpResponse::text(200, std::string(req.body)));  // copy: body dies with the handler
         });
         // Completes from a different thread, like the batcher will.
         server_->route("GET", "/async", [this](HttpRequest&&, Responder r) {

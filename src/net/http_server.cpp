@@ -276,10 +276,13 @@ private:
                 case HttpParser::Status::kComplete: {
                     const std::size_t used = c.parser.consumed();
                     HttpRequest req = c.parser.take_request();
-                    c.in.erase(0, used);
                     c.busy = true;
                     c.keep_alive = req.keep_alive;
+                    // req.body views c.in, so erase only after the handler
+                    // returns. (A handler never closes the connection
+                    // synchronously: responses are delivered later.)
                     server_.dispatch(std::move(req), Responder(this, c.id));
+                    c.in.erase(0, used);
                     break;  // loop exits: busy until the handler responds
                 }
             }

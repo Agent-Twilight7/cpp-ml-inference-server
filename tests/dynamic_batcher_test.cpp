@@ -1,4 +1,5 @@
 #include "infer/batching/dynamic_batcher.hpp"
+#include "infer/memory/block_pool.hpp"
 
 #include <gtest/gtest.h>
 
@@ -69,8 +70,6 @@ private:
     Shared& shared_;
 };
 
-std::vector<float> sample(float v) { return std::vector<float>(FakeBackend::kIn, v); }
-
 // What a callback saw, copied out (the output span dies after the callback).
 struct Outcome {
     InferStatus status;
@@ -81,6 +80,14 @@ struct Outcome {
 
 class BatcherTest : public ::testing::Test {
 protected:
+    // A pool block holding one sample filled with `v`.
+    infer::BlockPool::Block sample(float v) {
+        infer::BlockPool::Block b = pool_.try_acquire();
+        EXPECT_TRUE(b) << "test pool exhausted";
+        for (float& x : b.span()) x = v;
+        return b;
+    }
+
     std::unique_ptr<DynamicBatcher> make(BatcherOptions opts) {
         auto b = std::make_unique<DynamicBatcher>(opts, [this] { return std::make_unique<FakeBackend>(shared_); });
         b->start();
@@ -101,6 +108,7 @@ protected:
     }
 
     FakeBackend::Shared shared_;
+    infer::BlockPool pool_{FakeBackend::kIn, 4096};  // outlives every batcher in a test
 };
 
 }  // namespace
@@ -146,6 +154,7 @@ TEST_F(BatcherTest, EachCallerGetsItsOwnResult) {
         EXPECT_EQ(o.output[1], 2.0f * static_cast<float>(i)) << "request " << i;
     }
     for (std::size_t s : shared_.sizes()) EXPECT_LE(s, 16u);
+    EXPECT_EQ(pool_.in_use(), 0u) << "input blocks must return to the pool once batched";
 }
 
 TEST_F(BatcherTest, PadsToBackendBucketsAndIgnoresPaddingRows) {

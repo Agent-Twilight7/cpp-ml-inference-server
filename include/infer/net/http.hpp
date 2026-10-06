@@ -16,7 +16,9 @@ struct HttpRequest {
     std::string target;  // path plus optional "?query"
     int version_minor = 1;  // HTTP/1.<minor>
     HeaderList headers;     // names lower-cased, values trimmed
-    std::string body;
+    // Points into the connection's receive buffer: no copy, no allocation, but
+    // valid only until the handler returns. Copy it to keep it longer.
+    std::string_view body;
     bool keep_alive = true;
 
     std::string_view path() const;
@@ -40,8 +42,9 @@ const char* reason_phrase(int status);
 void serialize(const HttpResponse& resp, bool keep_alive, std::string& out);
 
 // Incremental HTTP/1.x request parser. The caller owns the receive buffer and
-// calls parse() each time more bytes arrive; on kComplete it removes
-// `consumed()` bytes from the front of the buffer and takes the request.
+// calls parse() each time more bytes arrive; on kComplete it takes the request
+// (whose body views the buffer), uses it, then removes `consumed()` bytes from
+// the front of the buffer.
 //
 // Only Content-Length bodies are supported (chunked uploads get 501).
 class HttpParser {

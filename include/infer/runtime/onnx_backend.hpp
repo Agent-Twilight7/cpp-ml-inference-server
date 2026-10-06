@@ -26,6 +26,8 @@ struct OnnxBackendOptions {
     // matters on CUDA, where ORT redoes per-layer setup (~30 ms for ResNet-18)
     // every time a session sees a different input shape than its last run.
     std::vector<std::size_t> batch_buckets{};
+    // On CUDA, give batch buffers page-locked (pinned) host memory.
+    bool pinned_host_memory = true;
 };
 
 // Powers of two up to max_batch, plus max_batch itself: 1, 2, 4, ..., max.
@@ -40,6 +42,9 @@ public:
     std::size_t input_elems_per_sample() const override { return input_elems_; }
     std::size_t output_elems_per_sample() const override { return output_elems_; }
     std::size_t padded_batch_size(std::size_t n) const override;
+    // On CUDA: page-locked host memory from ORT's CudaPinned allocator, so
+    // host<->device copies are direct DMA. Falls back to aligned heap memory.
+    HostBuffer allocate_host_buffer(std::size_t floats) override;
 
     void run(std::span<const float> input, std::span<float> output, std::size_t batch) override;
 
@@ -52,6 +57,9 @@ private:
 
     // sessions_[i] serves batches of exactly buckets_[i]; with no buckets
     // there is a single session for every size.
+    Device device_ = Device::kCpu;
+    int cuda_device_id_ = 0;
+    bool pinned_ = true;
     std::vector<std::size_t> buckets_;
     std::vector<Ort::Session> sessions_;
     Ort::MemoryInfo mem_info_{nullptr};

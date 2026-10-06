@@ -5,9 +5,9 @@ stack**, **dynamic batching** (the technique behind NVIDIA Triton and vLLM),
 preallocated memory pools, ONNX Runtime execution on CPU or **CUDA GPU**, and a
 metrics endpoint with p50/p99 latency, throughput, queue depth and batch sizes.
 
-> **Status: Phase 3 done.** Dynamic batching on GPU serves **1,537 req/s
-> (2.3× unbatched) with p99 latency down from 126 ms to 49 ms**. Next:
-> memory pools. See [Roadmap](#roadmap).
+> **Status: Phase 4 done.** Dynamic batching plus pinned, pooled memory serves
+> **1,912 req/s on one laptop GPU (2.9× unbatched), with p99 latency down from
+> 126 ms to 42 ms**. Next: metrics. See [Roadmap](#roadmap).
 
 ---
 
@@ -19,6 +19,7 @@ metrics endpoint with p50/p99 latency, throughput, queue depth and batch sizes.
   - [Target design](#target-design)
   - [Network layer](#network-layer-srcnet)
   - [Dynamic batcher](#dynamic-batcher-srcbatching)
+  - [Memory: pools and the data path](#memory-pools-and-the-data-path-srcmemory)
   - [Model runtime](#model-runtime-srcruntime)
 - [API](#api)
 - [Build and run](#build-and-run)
@@ -40,12 +41,14 @@ one image per request for 6 s (`scripts/infer_client.py`, 8 client processes).
 | 16 | off | 652 req/s | 25.7 ms | 30.9 ms | 37.0 ms | 1.0 |
 | 16 | **on** | **1,184 req/s** | **14.4 ms** | **16.3 ms** | **19.3 ms** | 10.2 |
 | 64 | off | 665 req/s | 103.3 ms | 110.8 ms | 126.0 ms | 1.0 |
-| 64 | **on** | **1,537 req/s** | **44.5 ms** | **46.5 ms** | **49.2 ms** | 16.0 |
+| 64 | on | 1,537 req/s | 44.5 ms | 46.5 ms | 49.2 ms | 16.0 |
+| 64 | **on + pinned memory** (Phase 4) | **1,912 req/s** | **35.3 ms** | **37.9 ms** | **41.7 ms** | 16.0 |
 
 Batching lowers latency as well as raising throughput: unbatched requests
 queue behind each other one image at a time, while a batch of 16 takes about
-9 ms on the GPU. 1,537 req/s is close to the GPU's ceiling of ~1,700
-images/s at batch 16. (A dedicated C++ load generator comes in Phase 6.)
+9 ms on the GPU. Pinned batch buffers then add another 23% at full load by
+making host→GPU copies direct DMA. (A dedicated C++ load generator comes in
+Phase 6.)
 
 A larger `--max-batch 32` was *slower* at 64 clients (1,240 req/s): batches
 averaged 23 requests and got padded to 32, and bigger batches mean longer
@@ -114,7 +117,7 @@ flowchart LR
     subgraph core["Batching core ✅"]
         q[["Bounded request queue ✅"]]
         b["Dynamic batcher ✅<br/>max_batch / max_delay"]
-        mp[("Memory pool<br/>preallocated tensors (Phase 4)")]
+        mp[("Memory pools ✅<br/>lock-free request blocks,<br/>pinned batch buffers")]
     end
 
     subgraph exec["Executors"]
@@ -295,6 +298,62 @@ full (run immediately). Other submits make no wake-up call at all.
 **`--max-batch 1` turns batching off** while keeping exactly the same
 pipeline, which is how the "off" rows in [Results](#results) were measured.
 
+### Memory: pools and the data path (`src/memory/`)
+
+Every request carries a 602 KB tensor. Allocating that per request means
+`malloc` of large blocks (often `mmap`/`munmap` plus page faults) on the hot
+path, on every thread. Instead, **no tensor-sized buffer is allocated after
+startup**:
+
+```mermaid
+flowchart LR
+    k["kernel socket buffer"] -->|recv| cin["connection buffer<br/>(reused across requests)"]
+    cin -->|"memcpy #1<br/>body is a string_view, no copy before this"| blk["request block<br/>BlockPool (lock-free)"]
+    blk -->|"memcpy #2 (gather)<br/>block returned to pool immediately"| bin["batch buffer<br/>pinned host memory"]
+    bin -->|"DMA, no staging copy"| gpu["GPU"]
+```
+
+**`BlockPool`: lock-free, fixed-size blocks.** One slab is allocated at
+startup and cut into cache-line-aligned blocks. The free list is a Treiber
+stack. Its head is a single 64-bit atomic packing a 32-bit block index with a
+32-bit version tag, so acquire and release are each one compare-and-swap with
+no locks. The tag defeats the classic ABA bug: if another thread pops and
+pushes back the same block between this thread's load and its CAS, the tag
+has changed and the CAS fails instead of corrupting the list.
+
+- **RAII handles.** `BlockPool::Block` is move-only and returns itself to the
+  pool on destruction, so leaks are impossible by construction.
+- **LIFO reuse.** The block released most recently is handed out next, while
+  it's still warm in cache and TLB. Blocks never used never get physical pages,
+  so a large pool costs nothing until load needs it.
+- **Bounded memory.** The pool holds `queue_size + workers × max_batch` blocks.
+  When it's empty the request gets 503, so memory has a hard ceiling even under
+  overload.
+- **Early return.** The batcher returns each request's block right after
+  copying it into the batch buffer, *before* the model runs, so a block is held
+  for microseconds instead of a whole inference.
+
+**Zero-copy HTTP body.** The parser hands handlers the body as a
+`std::string_view` into the connection's receive buffer, which keeps its
+capacity across keep-alive requests. The connection erases the bytes only
+after the handler returns.
+
+**Pinned batch buffers.** `ModelBackend::allocate_host_buffer()` lets the
+backend choose where batch buffers live. On CUDA, `OnnxBackend` returns
+page-locked memory from ONNX Runtime's `CudaPinned` allocator. A copy from
+pageable memory has to be staged by the driver through an internal pinned
+buffer; from pinned memory the GPU can DMA directly.
+
+| 64 clients, batching on | Throughput | p50 | p99 |
+|---|---:|---:|---:|
+| pageable batch buffers (`--pinned 0`) | 1,551 req/s | 44.9 ms | 50.4 ms |
+| **pinned batch buffers** (default) | **1,912 req/s** | **35.3 ms** | **41.7 ms** |
+
+Pool tests include an 8-thread stress test hammering a 4-block pool
+(160,000 acquire/write/verify/release cycles). It checks that no block is
+ever held by two threads and that all blocks come back, and it passes under
+ThreadSanitizer.
+
 ### Model runtime (`src/runtime/`)
 
 `ModelBackend` is the interface the server sees: run *B* samples from a
@@ -305,8 +364,8 @@ caller-owned input buffer into a caller-owned output buffer.
 - It reads input and output shapes from the model and requires dimension 0 to
   be a dynamic batch dimension.
 - `Ort::Value::CreateTensor` wraps the caller's memory directly, so tensor
-  data is never copied or allocated by the backend. Later, the memory pool
-  plugs straight in here.
+  data is never copied or allocated by the backend; the batcher's pinned
+  buffers are used in place.
 - `--device cuda` attaches the CUDA execution provider. The CUDA/cuDNN
   runtime comes from pip wheels, so no system CUDA toolkit is needed.
 
@@ -423,6 +482,7 @@ cmake --build build-cuda
 | `--queue-size` | `1024` | waiting requests before new ones get 503 |
 | `--queue-timeout-ms` | `0` (off) | fail requests that waited longer with 504 |
 | `--buckets` | `auto` | batch-size buckets: `auto` (powers of two on CUDA, none on CPU), `none`, or a list like `1,4,16` |
+| `--pinned` | `1` | CUDA pinned batch buffers (`0` = pageable, for comparison) |
 
 ---
 
@@ -438,6 +498,9 @@ ctest --test-dir build --output-on-failure      # or ./build/unit_tests
   Covers keep-alive, in-order pipelining with an async handler, 1 MiB bodies
   arriving in pieces, 404/405, malformed input (400 and close), clients
   disconnecting mid-request, and 32 concurrent clients.
+- **Block pool:** distinct aligned blocks, exhaustion, no overlap, LIFO
+  reuse, RAII and move semantics, a custom (pinned-style) allocator, and an
+  8-thread contention stress test.
 - **Dynamic batcher**, with a fake backend that records batch sizes: a lone
   request waits about `max_delay`; a full batch runs without waiting; each of 40
   callers gets its own result; padding rows are ignored; 503 when the queue is
@@ -463,13 +526,15 @@ ctest --test-dir build --output-on-failure      # or ./build/unit_tests
 │   └── ort_smoke.cpp          C++ vs PyTorch check + batch-size timing
 ├── include/infer/
 │   ├── batching/              dynamic_batcher.hpp
+│   ├── memory/                block_pool.hpp (lock-free fixed-size blocks)
 │   ├── net/                   http.hpp (parser, types), http_server.hpp
 │   └── runtime/               model_backend.hpp, onnx_backend.hpp
 ├── src/
 │   ├── batching/              dynamic_batcher.cpp
+│   ├── memory/                block_pool.cpp
 │   ├── net/                   http.cpp, http_server.cpp (reactors)
 │   └── runtime/               onnx_backend.cpp (incl. batch-size buckets)
-├── tests/                     GoogleTest: batcher, parser, server integration
+├── tests/                     GoogleTest: block pool, batcher, parser, server integration
 ├── models/                    export_resnet.py (PyTorch → ONNX + reference data)
 ├── scripts/                   environment setup, CUDA env, infer_client.py
 └── third_party/               ONNX Runtime (downloaded, git-ignored)
@@ -483,7 +548,7 @@ ctest --test-dir build --output-on-failure      # or ./build/unit_tests
 - [x] Phase 1: C++ inference matches PyTorch (CPU + CUDA)
 - [x] Phase 2: epoll HTTP server, unbatched baseline
 - [x] Phase 3: request queue + dynamic batcher + worker completion path
-- [ ] Phase 4: memory pools (no per-request allocation on the hot path)
+- [x] Phase 4: memory pools (no per-request tensor allocation) + pinned memory
 - [ ] Phase 5: `/metrics` (Prometheus) and `/stats` (JSON)
 - [ ] Phase 6: load generator and benchmarks (batching on vs off)
 - [ ] Phase 7: Docker, CI, graceful shutdown

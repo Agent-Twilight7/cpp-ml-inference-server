@@ -1,9 +1,15 @@
 #pragma once
 
 #include <cstddef>
+#include <functional>
+#include <memory>
+#include <new>
 #include <span>
 
 namespace infer {
+
+// Host memory for batch tensors, freed by whoever allocated it.
+using HostBuffer = std::unique_ptr<float[], std::function<void(float*)>>;
 
 // A model that consumes a batch of fixed-size float samples and produces a
 // batch of fixed-size float outputs. Buffers are caller-owned so the server can
@@ -22,6 +28,14 @@ public:
     // Backends that only support certain sizes round up; the caller fills the
     // extra rows with anything and ignores their outputs.
     virtual std::size_t padded_batch_size(std::size_t n) const { return n; }
+
+    // Allocates host memory for batch buffers. A GPU backend can return memory
+    // that transfers faster to its device (CUDA pinned memory). The buffer
+    // must be freed before the backend is destroyed.
+    virtual HostBuffer allocate_host_buffer(std::size_t floats) {
+        auto* p = static_cast<float*>(::operator new[](floats * sizeof(float), std::align_val_t{64}));
+        return HostBuffer(p, [](float* q) { ::operator delete[](q, std::align_val_t{64}); });
+    }
 
     // Runs `batch` samples, where batch is a value padded_batch_size() can
     // return. `input` holds batch * input_elems_per_sample() floats, `output`

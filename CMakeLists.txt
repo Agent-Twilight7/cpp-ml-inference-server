@@ -57,6 +57,7 @@ find_package(Threads REQUIRED)
 # ---- Core library ----
 add_library(infer_core STATIC
     src/batching/dynamic_batcher.cpp
+    src/memory/block_pool.cpp
     src/net/http.cpp
     src/net/http_server.cpp
     src/runtime/onnx_backend.cpp
@@ -85,6 +86,7 @@ if(INFER_BUILD_TESTS)
 
     enable_testing()
     add_executable(unit_tests
+        tests/block_pool_test.cpp
         tests/dynamic_batcher_test.cpp
         tests/http_parser_test.cpp
         tests/http_server_test.cpp

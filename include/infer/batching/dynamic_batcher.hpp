@@ -1,5 +1,6 @@
 #pragma once
 
+#include "infer/memory/block_pool.hpp"
 #include "infer/runtime/model_backend.hpp"
 
 #include <chrono>
@@ -67,10 +68,11 @@ public:
     // launches the worker threads.
     void start();
 
-    // Thread-safe. `input` must hold exactly input_elems() floats. Returns
-    // false, without calling `done`, if the queue is full or the batcher is
-    // stopping.
-    bool submit(std::vector<float>&& input, InferCallback done);
+    // Thread-safe. `input` is a pool block holding exactly input_elems()
+    // floats; it goes back to its pool as soon as it has been copied into a
+    // batch. Returns false, without calling `done`, if the queue is full or the
+    // batcher is stopping (the block is then released by the caller's handle).
+    bool submit(BlockPool::Block&& input, InferCallback done);
 
     // Stops accepting work, lets the workers finish everything already queued
     // (without waiting out max_queue_delay), and joins them. Idempotent.
@@ -83,17 +85,22 @@ public:
 
 private:
     struct Request {
-        std::vector<float> input;
+        BlockPool::Block input;
         InferCallback done;
         Clock::time_point enqueued;
     };
 
     struct Worker {
+        // Declared before the buffers: the backend may own their allocator,
+        // so it must be destroyed after them.
         std::unique_ptr<ModelBackend> backend;
-        std::vector<float> batch_in;   // max_batch * input_elems, allocated once
-        std::vector<float> batch_out;  // max_batch * output_elems, allocated once
-        std::vector<Request> batch;    // reused across batches
+        HostBuffer batch_in;   // padded max batch * input_elems, allocated once
+        HostBuffer batch_out;  // padded max batch * output_elems, allocated once
+        std::vector<Request> batch;  // reused across batches
         std::thread thread;
+
+        std::span<const float> inputs(std::size_t n, std::size_t elems) const { return {batch_in.get(), n * elems}; }
+        std::span<float> outputs(std::size_t n, std::size_t elems) const { return {batch_out.get(), n * elems}; }
     };
 
     void worker_loop(Worker& w);

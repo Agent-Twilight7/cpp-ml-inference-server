@@ -133,7 +133,7 @@ HttpParser::Status HttpParser::parse(std::string_view buf) {
     const std::size_t total = *head_len_ + body_len_;
     if (buf.size() < total) return Status::kNeedMore;
 
-    req_.body.assign(buf.substr(*head_len_, body_len_));
+    req_.body = buf.substr(*head_len_, body_len_);
     consumed_ = total;
     return Status::kComplete;
 }

@@ -1,6 +1,8 @@
 #include "infer/runtime/onnx_backend.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
 #include <stdexcept>
 
 namespace infer {
@@ -67,6 +69,9 @@ OnnxBackend::OnnxBackend(const OnnxBackendOptions& opts) {
 #endif
     }
 
+    device_ = opts.device;
+    cuda_device_id_ = opts.cuda_device_id;
+    pinned_ = opts.pinned_host_memory;
     buckets_ = opts.batch_buckets;
     std::sort(buckets_.begin(), buckets_.end());
     buckets_.erase(std::unique(buckets_.begin(), buckets_.end()), buckets_.end());
@@ -118,6 +123,25 @@ Ort::Session& OnnxBackend::session_for(std::size_t batch) {
         throw std::invalid_argument("batch size " + std::to_string(batch) + " is not a bucket; use padded_batch_size()");
     }
     return sessions_[static_cast<std::size_t>(it - buckets_.begin())];
+}
+
+HostBuffer OnnxBackend::allocate_host_buffer(std::size_t floats) {
+    if (device_ == Device::kCuda && pinned_) {
+        try {
+            // The allocator is shared by the deleter so it lives as long as the
+            // buffer; it in turn refers to the session, which outlives both.
+            Ort::MemoryInfo pinned("CudaPinned", OrtDeviceAllocator, cuda_device_id_, OrtMemTypeCPUOutput);
+            auto alloc = std::make_shared<Ort::Allocator>(sessions_.front(), pinned);
+            auto* p = static_cast<float*>(alloc->Alloc(floats * sizeof(float)));
+            return HostBuffer(p, [alloc](float* q) { alloc->Free(q); });
+        } catch (const Ort::Exception& e) {
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true)) {
+                std::fprintf(stderr, "warning: CUDA pinned memory unavailable (%s); using pageable memory\n", e.what());
+            }
+        }
+    }
+    return ModelBackend::allocate_host_buffer(floats);
 }
 
 std::vector<std::size_t> power_of_two_buckets(std::size_t max_batch) {
