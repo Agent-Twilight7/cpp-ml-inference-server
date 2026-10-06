@@ -1,5 +1,7 @@
 # C++ ML Inference Server
 
+[![ci](https://github.com/Agent-Twilight7/cpp-ml-inference-server/actions/workflows/ci.yml/badge.svg)](https://github.com/Agent-Twilight7/cpp-ml-inference-server/actions/workflows/ci.yml)
+
 A GPU model-serving server written from scratch in C++20, in the spirit of
 NVIDIA Triton: a custom **epoll HTTP/1.1 stack**, **dynamic batching**,
 **lock-free memory pools** with pinned host memory, ONNX Runtime execution on
