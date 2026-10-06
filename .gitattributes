@@ -1,0 +1,4 @@
+# Built and run on Linux: keep LF endings even when edited on Windows.
+* text=auto eol=lf
+*.bin binary
+*.onnx binary

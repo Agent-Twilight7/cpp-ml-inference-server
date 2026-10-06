@@ -1,0 +1,10 @@
+build*/
+third_party/
+.venv/
+__pycache__/
+*.onnx
+*.onnx.data
+models/*.bin
+compile_commands.json
+.cache/
+.vscode/
