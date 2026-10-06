@@ -10,9 +10,17 @@
 
 namespace infer {
 
+enum class Device { kCpu, kCuda };
+
+// Parses "cpu" / "cuda"; throws std::invalid_argument otherwise.
+Device parse_device(const std::string& s);
+const char* to_string(Device d);
+
 struct OnnxBackendOptions {
     std::string model_path;
-    int intra_op_threads = 1;  // threads ORT may use inside a single Run()
+    Device device = Device::kCpu;
+    int cuda_device_id = 0;
+    int intra_op_threads = 1;  // CPU threads ORT may use inside a single Run()
 };
 
 // ModelBackend over an ONNX model with exactly one float input and one float

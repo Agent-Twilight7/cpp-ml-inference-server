@@ -2,7 +2,7 @@
 // reference batch exported by models/export_resnet.py, compare against
 // PyTorch's output, then time a few batch sizes to show why batching matters.
 //
-// Usage: ort_smoke [models_dir] [intra_op_threads]
+// Usage: ort_smoke [models_dir] [cpu|cuda] [intra_op_threads]
 
 #include "infer/runtime/onnx_backend.hpp"
 
@@ -39,12 +39,15 @@ std::size_t argmax(const float* v, std::size_t n) {
 
 int run_smoke(int argc, char** argv) {
     const std::string dir = argc > 1 ? argv[1] : "models";
-    const int threads = argc > 2 ? std::atoi(argv[2]) : 1;
+    const infer::Device device = infer::parse_device(argc > 2 ? argv[2] : "cpu");
+    const int threads = argc > 3 ? std::atoi(argv[3]) : 1;
 
-    infer::OnnxBackend backend({.model_path = dir + "/resnet18.onnx", .intra_op_threads = threads});
+    infer::OnnxBackend backend(
+        {.model_path = dir + "/resnet18.onnx", .device = device, .intra_op_threads = threads});
     const std::size_t in_n = backend.input_elems_per_sample();
     const std::size_t out_n = backend.output_elems_per_sample();
-    std::printf("model loaded: %zu input floats/sample, %zu output floats/sample\n", in_n, out_n);
+    std::printf("model loaded on %s: %zu input floats/sample, %zu output floats/sample\n", infer::to_string(device),
+                in_n, out_n);
 
     // ---- Correctness against PyTorch ----
     const std::vector<float> ref_in = read_floats(dir + "/ref_input.bin");
@@ -66,15 +69,17 @@ int run_smoke(int argc, char** argv) {
     }
     std::printf("batch=%zu  max abs diff vs PyTorch = %.3e  top-1 agreement = %zu/%zu\n", batch, max_diff, top1_match,
                 batch);
-    const bool ok = max_diff < 1e-3f && top1_match == batch;
+    // cuDNN may use TF32 math for convolutions, so the GPU gets a looser bound.
+    const float tolerance = device == infer::Device::kCuda ? 2e-2f : 1e-3f;
+    const bool ok = max_diff < tolerance && top1_match == batch;
     std::printf("correctness: %s\n", ok ? "PASS" : "FAIL");
 
     // ---- Throughput by batch size ----
     std::printf("\n%8s %12s %14s %16s\n", "batch", "ms/batch", "ms/sample", "samples/sec");
-    for (std::size_t b : {1u, 2u, 4u, 8u, 16u, 32u}) {
+    for (std::size_t b : {1u, 2u, 4u, 8u, 16u, 32u, 64u}) {
         std::vector<float> in(b * in_n, 0.5f);
         std::vector<float> o(b * out_n);
-        backend.run(in, o, b);  // warm-up
+        backend.run(in, o, b);  // warm-up (cuDNN picks kernels per new shape)
 
         constexpr int kIters = 10;
         const auto t0 = std::chrono::steady_clock::now();

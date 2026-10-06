@@ -33,13 +33,38 @@ std::size_t elem_count(const std::vector<int64_t>& shape) {
 
 }  // namespace
 
+Device parse_device(const std::string& s) {
+    if (s == "cpu") return Device::kCpu;
+    if (s == "cuda") return Device::kCuda;
+    throw std::invalid_argument("unknown device '" + s + "' (expected cpu or cuda)");
+}
+
+const char* to_string(Device d) { return d == Device::kCuda ? "cuda" : "cpu"; }
+
 OnnxBackend::OnnxBackend(const OnnxBackendOptions& opts) {
+    // The Env must exist before any SessionOptions call that touches ORT's
+    // logger (e.g. appending the CUDA provider), so create it first.
+    Ort::Env& env = ort_env();
+
     Ort::SessionOptions so;
     so.SetIntraOpNumThreads(opts.intra_op_threads);
     so.SetInterOpNumThreads(1);
     so.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
 
-    session_ = Ort::Session(ort_env(), opts.model_path.c_str(), so);
+    if (opts.device == Device::kCuda) {
+#ifdef INFER_HAS_CUDA
+        // Inputs/outputs stay in host memory; ORT copies them to and from the
+        // GPU around each Run(). Nodes CUDA can't run fall back to CPU.
+        OrtCUDAProviderOptions cuda{};
+        cuda.device_id = opts.cuda_device_id;
+        cuda.cudnn_conv_algo_search = OrtCudnnConvAlgoSearchHeuristic;
+        so.AppendExecutionProvider_CUDA(cuda);
+#else
+        throw std::runtime_error("built without CUDA support; reconfigure with -DINFER_ENABLE_CUDA=ON");
+#endif
+    }
+
+    session_ = Ort::Session(env, opts.model_path.c_str(), so);
     mem_info_ = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
 
     if (session_.GetInputCount() != 1 || session_.GetOutputCount() != 1) {

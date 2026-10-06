@@ -28,9 +28,20 @@ if(INFER_ENABLE_TSAN)
 endif()
 
 # ---- ONNX Runtime (prebuilt, fetched by scripts/fetch_onnxruntime.sh) ----
-set(ONNXRUNTIME_ROOT "${CMAKE_SOURCE_DIR}/third_party/onnxruntime" CACHE PATH "ONNX Runtime install dir")
+# INFER_ENABLE_CUDA picks the GPU build of ORT, which also runs on CPU; the
+# CUDA provider itself is loaded at runtime only when --device cuda is used.
+option(INFER_ENABLE_CUDA "Link the CUDA 12 build of ONNX Runtime" OFF)
+if(INFER_ENABLE_CUDA)
+    set(_ort_default "${CMAKE_SOURCE_DIR}/third_party/onnxruntime-gpu")
+    set(_ort_flavor gpu)
+else()
+    set(_ort_default "${CMAKE_SOURCE_DIR}/third_party/onnxruntime")
+    set(_ort_flavor cpu)
+endif()
+set(ONNXRUNTIME_ROOT "${_ort_default}" CACHE PATH "ONNX Runtime install dir")
 if(NOT EXISTS "${ONNXRUNTIME_ROOT}/include/onnxruntime_cxx_api.h")
-    message(FATAL_ERROR "ONNX Runtime not found in ${ONNXRUNTIME_ROOT}. Run scripts/fetch_onnxruntime.sh")
+    message(FATAL_ERROR "ONNX Runtime not found in ${ONNXRUNTIME_ROOT}. "
+                        "Run: ORT_FLAVOR=${_ort_flavor} scripts/fetch_onnxruntime.sh")
 endif()
 
 add_library(onnxruntime SHARED IMPORTED)
@@ -49,6 +60,9 @@ add_library(infer_core STATIC
 )
 target_include_directories(infer_core PUBLIC include)
 target_link_libraries(infer_core PUBLIC onnxruntime Threads::Threads)
+if(INFER_ENABLE_CUDA)
+    target_compile_definitions(infer_core PUBLIC INFER_HAS_CUDA=1)
+endif()
 
 # ---- Executables ----
 add_executable(ort_smoke apps/ort_smoke.cpp)
