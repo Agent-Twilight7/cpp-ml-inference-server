@@ -18,15 +18,41 @@ and CI with sanitizers.
 - **Measured, not guessed:** an open-loop (coordinated-omission-safe) C++ load
   generator; profiling via the server's own metrics found a **30 ms-per-batch
   ONNX Runtime shape-change penalty** whose fix raised throughput 4×.
-- **Tested:** 57 GoogleTest tests over real sockets and a fake model, clean
+- **Tested:** 58 GoogleTest tests over real sockets and a fake model, clean
   under **AddressSanitizer, UBSan and ThreadSanitizer**, in GitHub Actions CI.
 
 ![Throughput and p99 latency vs concurrency](docs/images/concurrency.png)
 
 ---
 
+## Web demo
+
+Start the server with `--web web` and open it in a browser:
+
+```bash
+./build-cuda/inference_server --device cuda --port 8080 --web web
+# open http://localhost:8080/
+```
+
+- **Classify an image:** drop in any photo. The browser does the standard
+  ImageNet preprocessing (resize, center-crop 224×224, normalize) and sends the
+  tensor to `/v1/infer`, then shows the top-5 classes along with the batch size,
+  queue wait and model time for that request.
+- **Stress test:** pick 1 to 256 simultaneous users and press *Run*. Browsers
+  only open ~6 connections per site, too few to show batching, so the server
+  launches the bundled C++ `loadgen` against itself.
+- **Live dashboard:** throughput, p50/p99 latency, average batch size, queue
+  depth and the batch-size distribution, polled from `/stats` every second.
+  With 1 user every batch holds one image; at 64 users batches fill to 16 and
+  throughput jumps to ~1,800 req/s.
+
+![Web demo under a 64-user load test](docs/images/web_demo.png)
+
+---
+
 ## Contents
 
+- [Web demo](#web-demo)
 - [Results](#results)
 - [Why batching?](#why-batching)
 - [Architecture](#architecture)
@@ -650,6 +676,7 @@ cmake --build build-cuda
 | `--buckets` | `auto` | batch-size buckets: `auto` (powers of two on CUDA, none on CPU), `none`, or a list like `1,4,16` |
 | `--pinned` | `1` | CUDA pinned batch buffers (`0` = pageable, for comparison) |
 | `--drain-timeout-ms` | `10000` | graceful-shutdown budget for in-flight requests |
+| `--web` | off | serve the browser demo from this directory (e.g. `web`) |
 
 ---
 
@@ -777,17 +804,18 @@ ctest --test-dir build --output-on-failure      # or ./build/unit_tests
 │   ├── metrics/               histogram.hpp (lock-free log-linear histogram, counters)
 │   ├── net/                   http.hpp (parser, types), http_server.hpp
 │   ├── runtime/               model_backend.hpp, onnx_backend.hpp
-│   └── server/                inference_service.hpp (HTTP API, /stats, /metrics)
+│   └── server/                inference_service.hpp (HTTP API, /stats, /metrics), web_demo.hpp
 ├── src/
 │   ├── batching/              dynamic_batcher.cpp
 │   ├── memory/                block_pool.cpp
 │   ├── metrics/               histogram.cpp
 │   ├── net/                   http.cpp, http_server.cpp (reactors)
 │   ├── runtime/               onnx_backend.cpp (incl. batch-size buckets)
-│   └── server/                inference_service.cpp
+│   └── server/                inference_service.cpp, web_demo.cpp
 ├── tests/                     GoogleTest: pool, batcher, histogram, parser, server, API
 ├── bench/                     run_benchmarks.py, plot_results.py, results/*.json
-├── docs/images/               benchmark charts
+├── docs/images/               benchmark charts, web demo screenshot
+├── web/                       browser demo (index.html, ImageNet labels.json)
 ├── models/                    export_resnet.py (PyTorch → ONNX + reference data)
 ├── scripts/                   environment setup, CUDA env, infer_client.py
 ├── deploy/                    Prometheus config, Grafana provisioning + dashboard
@@ -821,6 +849,11 @@ or documented:
   TSan doesn't intercept `pthread_cond_clockwait` (used by
   `condition_variable::wait_until` on `steady_clock`), so it reported a phantom
   double lock. Clang's TSan is clean.
+- **`SO_REUSEPORT` accepts strangers.** It lets *any* process of the same
+  user bind the port, so a second server instance silently took half the
+  connections (found while testing the web demo against an older instance).
+  The server now probes the port without `SO_REUSEPORT` first and refuses to
+  start if it's taken. A regression test covers this.
 - **Batching has a cost at low load.** At one connection, a lone request waits
   the full batching delay. That's the price of capacity under load, made
   explicit in the results instead of hidden.

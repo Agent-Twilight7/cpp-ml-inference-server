@@ -188,3 +188,9 @@ TEST_F(HttpServerTest, GracefulDrainFinishesInFlightAndRefusesNew) {
     EXPECT_FALSE(fresh.connected());  // listeners are closed: new connections refused
     EXPECT_TRUE(server_->wait_drained(std::chrono::seconds(2)));
 }
+
+TEST_F(HttpServerTest, SecondServerOnSamePortFailsInsteadOfSharingIt) {
+    // SO_REUSEPORT would otherwise let it silently take half the connections.
+    HttpServer second(HttpServerOptions{.host = "127.0.0.1", .port = server_->port(), .num_reactors = 1});
+    EXPECT_THROW(second.start(), std::runtime_error);
+}

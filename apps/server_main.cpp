@@ -8,6 +8,7 @@
 //                    [--max-batch 16] [--max-delay-us 2000]
 //                    [--queue-size 1024] [--queue-timeout-ms 0]
 //                    [--buckets auto] [--pinned 1] [--drain-timeout-ms 10000]
+//                    [--web web]   (browser demo at http://localhost:PORT/)
 //
 // --max-batch 1 turns batching off (same pipeline, one request per run).
 // Endpoints: /health, /v1/infer, /stats, /metrics (see InferenceService).
@@ -17,6 +18,7 @@
 #include "infer/net/http_server.hpp"
 #include "infer/runtime/onnx_backend.hpp"
 #include "infer/server/inference_service.hpp"
+#include "infer/server/web_demo.hpp"
 
 #include <algorithm>
 #include <csignal>
@@ -26,6 +28,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -44,6 +47,7 @@ struct Config {
     std::string buckets = "auto";  // "auto", "none", or e.g. "1,2,4,8,16"
     bool pinned = true;            // CUDA pinned batch buffers
     long drain_timeout_ms = 10000;  // graceful shutdown budget
+    std::string web_dir;            // serve the browser demo from here ("" = off)
 };
 
 [[noreturn]] void usage(const char* argv0) {
@@ -51,7 +55,7 @@ struct Config {
                  "usage: %s [--model PATH] [--device cpu|cuda] [--port N] [--reactors N] [--workers N]\n"
                  "          [--ort-threads N] [--max-batch N] [--max-delay-us N] [--queue-size N]\n"
                  "          [--queue-timeout-ms N] [--buckets auto|none|N,N,...] [--pinned 0|1]\n"
-                 "          [--drain-timeout-ms N]\n",
+                 "          [--drain-timeout-ms N] [--web DIR]\n",
                  argv0);
     std::exit(2);
 }
@@ -89,6 +93,8 @@ Config parse_args(int argc, char** argv) {
             cfg.pinned = value != "0";
         } else if (flag == "--drain-timeout-ms") {
             cfg.drain_timeout_ms = std::stol(value);
+        } else if (flag == "--web") {
+            cfg.web_dir = value;
         } else {
             usage(argv[0]);
         }
@@ -192,10 +198,30 @@ int main(int argc, char** argv) {
         infer::InferenceService service(batcher, *request_pool, &batcher_metrics);
         infer::net::HttpServer server({.port = cfg.port, .num_reactors = cfg.reactors});
         service.install(server);
+
+        std::optional<infer::WebDemo> web;
+        if (!cfg.web_dir.empty()) {
+            const std::string model_dir = cfg.model.substr(0, cfg.model.rfind('/') + 1);
+            const std::string ref_input = model_dir + "ref_input.bin";
+            char info[512];
+            std::snprintf(info, sizeof(info),
+                          "{\"model\":\"%s\",\"device\":\"%s\",\"max_batch\":%zu,\"max_delay_us\":%ld,"
+                          "\"workers\":%d,\"reactors\":%d,\"buckets\":\"%s\",\"pinned\":%s}",
+                          cfg.model.c_str(), infer::to_string(cfg.device), cfg.max_batch, cfg.max_delay_us,
+                          cfg.workers, cfg.reactors, join(buckets).c_str(), cfg.pinned ? "true" : "false");
+            web.emplace(infer::WebDemoOptions{
+                .web_dir = cfg.web_dir,
+                .info_json = info,
+                .port = cfg.port,
+                .loadgen_input = ::access(ref_input.c_str(), R_OK) == 0 ? ref_input : "",
+            });
+            web->install(server);
+        }
         service.start();
         server.start();
         std::fprintf(stderr, "listening on :%u | reactors=%d workers=%d max_batch=%zu max_delay=%ldus queue=%zu\n",
                      server.port(), cfg.reactors, cfg.workers, cfg.max_batch, cfg.max_delay_us, cfg.queue_size);
+        if (web) std::fprintf(stderr, "web demo: http://localhost:%u/\n", server.port());
 
         int sig = 0;
         sigwait(&signals, &sig);

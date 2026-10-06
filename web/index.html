@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Inference Server Demo</title>
+<style>
+  :root {
+    --bg: #f9f9f7; --surface: #fcfcfb; --border: #e7e6e2;
+    --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781; --grid: #ecebe7;
+    --blue: #2a78d6; --orange: #eb6834; --blue-soft: #dbe9fa;
+    --good: #0ca30c; --warn: #fab219;
+    --radius: 12px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d0d0d; --surface: #1a1a19; --border: #2c2c2a;
+      --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781; --grid: #2a2a28;
+      --blue: #3987e5; --orange: #d95926; --blue-soft: #1c2b40;
+    }
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 24px 16px 48px; }
+  header h1 { font-size: 26px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  header p { margin: 0; color: var(--ink-2); max-width: 760px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+  .chip { border: 1px solid var(--border); background: var(--surface); border-radius: 999px;
+          padding: 3px 10px; font-size: 13px; color: var(--ink-2); }
+  .chip b { color: var(--ink); font-weight: 600; }
+  .steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin: 20px 0; }
+  .step { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 16px; }
+  .step .n { font-size: 12px; font-weight: 700; color: var(--blue); text-transform: uppercase; letter-spacing: .06em; }
+  .step h3 { margin: 2px 0 4px; font-size: 15px; }
+  .step p { margin: 0; color: var(--ink-2); font-size: 14px; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px; }
+  .card h2 { font-size: 17px; margin: 0 0 4px; }
+  .card .sub { color: var(--ink-2); font-size: 14px; margin: 0 0 14px; }
+  .drop { border: 2px dashed var(--border); border-radius: var(--radius); padding: 18px; text-align: center;
+          color: var(--ink-2); cursor: pointer; transition: border-color .15s, background .15s; }
+  .drop:hover, .drop.over { border-color: var(--blue); background: var(--blue-soft); }
+  .result { display: grid; grid-template-columns: 160px 1fr; gap: 16px; margin-top: 14px; align-items: start; }
+  .result canvas { width: 160px; height: 160px; border-radius: 8px; background: var(--grid); }
+  .bar { margin-bottom: 8px; }
+  .bar .lbl { display: flex; justify-content: space-between; font-size: 14px; gap: 8px; }
+  .bar .lbl span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bar .track { height: 8px; background: var(--grid); border-radius: 4px; margin-top: 3px; overflow: hidden; }
+  .bar .fill { height: 100%; background: var(--blue); border-radius: 4px; transition: width .4s; }
+  .bar.top .lbl span:first-child { font-weight: 600; }
+  .timing { font-size: 13px; color: var(--ink-2); margin-top: 6px; }
+  .controls label { display: block; font-size: 14px; color: var(--ink-2); margin-bottom: 4px; }
+  .controls .val { color: var(--ink); font-weight: 700; font-size: 22px; }
+  input[type=range] { width: 100%; accent-color: var(--blue); }
+  .row { display: flex; gap: 12px; align-items: center; margin-top: 12px; flex-wrap: wrap; }
+  button { background: var(--blue); color: #fff; border: 0; border-radius: 8px; padding: 10px 18px;
+           font: inherit; font-weight: 600; cursor: pointer; }
+  button:disabled { opacity: .55; cursor: default; }
+  .progress { flex: 1; min-width: 120px; height: 8px; background: var(--grid); border-radius: 4px; overflow: hidden; }
+  .progress div { height: 100%; width: 0; background: var(--blue); transition: width .9s linear; }
+  .hint { font-size: 13px; color: var(--muted); margin-top: 10px; }
+  .presets { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+  .presets button { background: transparent; color: var(--ink-2); border: 1px solid var(--border);
+                    padding: 4px 10px; font-weight: 500; font-size: 13px; }
+  .presets button:hover { border-color: var(--blue); color: var(--ink); }
+  h2.section { font-size: 19px; margin: 28px 0 4px; }
+  p.section { color: var(--ink-2); margin: 0 0 12px; }
+  .kpis { display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; }
+  .kpi { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px; }
+  .kpi .k { font-size: 12px; color: var(--ink-2); text-transform: uppercase; letter-spacing: .05em; }
+  .kpi .v { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; margin-top: 2px; }
+  .kpi .v small { font-size: 13px; font-weight: 500; color: var(--ink-2); margin-left: 3px; }
+  .charts { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; margin-top: 16px; }
+  .chart h3 { font-size: 14px; margin: 0 0 6px; }
+  .legend { display: flex; gap: 14px; font-size: 12px; color: var(--ink-2); margin-bottom: 4px; }
+  .legend i { display: inline-block; width: 14px; height: 3px; border-radius: 2px; vertical-align: middle; margin-right: 5px; }
+  .chart svg { width: 100%; height: 170px; display: block; overflow: visible; }
+  .chart .tip { font-size: 12px; color: var(--ink-2); min-height: 18px; font-variant-numeric: tabular-nums; }
+  svg text { fill: var(--muted); font-size: 10px; font-family: inherit; }
+  .err { color: var(--orange); font-size: 14px; margin-top: 8px; }
+  footer { margin-top: 28px; color: var(--muted); font-size: 13px; }
+  @media (max-width: 900px) {
+    .grid2, .charts { grid-template-columns: 1fr; }
+    .kpis { grid-template-columns: repeat(3, 1fr); }
+    .steps { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 520px) {
+    .kpis { grid-template-columns: repeat(2, 1fr); }
+    .result { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>C++ ML Inference Server</h1>
+    <p>An image-recognition model served by a high-performance C++ server. Many users send images at once;
+       the server groups their requests into batches so the GPU processes them together, serving far more
+       people at the same speed.</p>
+    <div class="chips" id="chips"><span class="chip">connecting…</span></div>
+  </header>
+
+  <div class="steps">
+    <div class="step"><div class="n">1 · Requests arrive</div><h3>Many clients at once</h3>
+      <p>Each sends one image over HTTP to a custom epoll-based C++ network layer.</p></div>
+    <div class="step"><div class="n">2 · Dynamic batching</div><h3>Group, don't queue</h3>
+      <p>The batcher waits up to a couple of milliseconds and packs up to <b id="maxb">16</b> requests together.</p></div>
+    <div class="step"><div class="n">3 · One GPU run</div><h3>Results split back</h3>
+      <p>The whole batch runs on the model in one call; each client gets its own answer.</p></div>
+  </div>
+
+  <div class="grid2">
+    <section class="card">
+      <h2>Try it: classify an image</h2>
+      <p class="sub">Your photo is resized in the browser and sent to <code>/v1/infer</code> as a tensor.</p>
+      <div class="drop" id="drop">Drop an image here, or <u>click to choose</u> one
+        <input type="file" id="file" accept="image/*" hidden></div>
+      <div class="result" id="result" hidden>
+        <canvas id="preview" width="224" height="224"></canvas>
+        <div><div id="bars"></div><div class="timing" id="timing"></div></div>
+      </div>
+      <div class="err" id="inferErr"></div>
+    </section>
+
+    <section class="card controls">
+      <h2>Stress test: simulate many users</h2>
+      <p class="sub">Starts the bundled C++ load generator against this server. Watch the dashboard below.</p>
+      <label>Simultaneous users: <span class="val" id="connVal">64</span></label>
+      <input type="range" id="conn" min="0" max="8" step="1" value="6" aria-label="Simultaneous users">
+      <div class="presets">
+        <button data-c="0">1 user</button><button data-c="4">16 users</button>
+        <button data-c="6">64 users</button><button data-c="8">256 users</button>
+      </div>
+      <div class="row">
+        <button id="go">Run for 15 s</button>
+        <div class="progress"><div id="prog"></div></div>
+      </div>
+      <div class="hint" id="loadHint">Tip: try 1 user, then 64. With 1 user batches hold a single image; with 64 they fill up and throughput jumps.</div>
+    </section>
+  </div>
+
+  <h2 class="section">Live dashboard</h2>
+  <p class="section">Read from the server's own <code>/stats</code> endpoint every second (2-second window).</p>
+  <div class="kpis">
+    <div class="kpi"><div class="k">Throughput</div><div class="v" id="kTput">–</div></div>
+    <div class="kpi"><div class="k">Latency p50</div><div class="v" id="kP50">–</div></div>
+    <div class="kpi"><div class="k">Latency p99</div><div class="v" id="kP99">–</div></div>
+    <div class="kpi"><div class="k">Avg batch size</div><div class="v" id="kBatch">–</div></div>
+    <div class="kpi"><div class="k">Queue depth</div><div class="v" id="kQueue">–</div></div>
+    <div class="kpi"><div class="k">Open connections</div><div class="v" id="kConn">–</div></div>
+  </div>
+  <div class="charts">
+    <div class="card chart"><h3>Throughput (requests / s)</h3>
+      <div class="legend"><span><i style="background:var(--blue)"></i>req/s</span></div>
+      <svg id="cTput" role="img" aria-label="Throughput over time"></svg><div class="tip" id="tTput"></div></div>
+    <div class="card chart"><h3>Latency (ms)</h3>
+      <div class="legend"><span><i style="background:var(--blue)"></i>p50</span><span><i style="background:var(--orange)"></i>p99</span></div>
+      <svg id="cLat" role="img" aria-label="Latency over time"></svg><div class="tip" id="tLat"></div></div>
+    <div class="card chart"><h3>Batch sizes (last 2 s)</h3>
+      <div class="legend"><span><i style="background:var(--blue)"></i>batches of each size</span></div>
+      <svg id="cHist" role="img" aria-label="Batch size distribution"></svg><div class="tip" id="tHist"></div></div>
+  </div>
+
+  <footer>Endpoints: <code>POST /v1/infer</code> · <code>GET /stats</code> · <code>GET /metrics</code> (Prometheus) · <code>GET /health</code></footer>
+</div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const MEAN = [0.485, 0.456, 0.406], STD = [0.229, 0.224, 0.225];
+const CONN_STEPS = [1, 2, 4, 8, 16, 32, 64, 128, 256];
+let labels = [];
+let maxBatch = 16;
+const HISTORY = 90;
+const series = { t: [], tput: [], p50: [], p99: [] };
+let lastHist = {};
+
+fetch("/labels.json").then(r => r.json()).then(l => labels = l).catch(() => {});
+
+// ---------- server info ----------
+async function refreshInfo() {
+  try {
+    const i = await (await fetch("/info")).json();
+    maxBatch = i.max_batch;
+    $("maxb").textContent = i.max_batch;
+    const model = i.model.split("/").pop();
+    $("chips").innerHTML =
+      `<span class="chip">device <b>${i.device.toUpperCase()}</b></span>` +
+      `<span class="chip">model <b>${model}</b></span>` +
+      `<span class="chip">max batch <b>${i.max_batch}</b></span>` +
+      `<span class="chip">batch wait <b>${(i.max_delay_us / 1000).toFixed(1)} ms</b></span>` +
+      `<span class="chip">workers <b>${i.workers}</b></span>`;
+    setLoadState(i.load_running, i.load_remaining_s, i.load_connections);
+  } catch (e) {
+    $("chips").innerHTML = `<span class="chip">server unreachable</span>`;
+  }
+}
+
+// ---------- classify ----------
+const drop = $("drop"), file = $("file");
+drop.addEventListener("click", () => file.click());
+file.addEventListener("change", () => file.files[0] && classify(file.files[0]));
+drop.addEventListener("dragover", (e) => { e.preventDefault(); drop.classList.add("over"); });
+drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+drop.addEventListener("drop", (e) => {
+  e.preventDefault(); drop.classList.remove("over");
+  if (e.dataTransfer.files[0]) classify(e.dataTransfer.files[0]);
+});
+
+async function classify(f) {
+  $("inferErr").textContent = "";
+  const img = await createImageBitmap(f);
+  // Standard ImageNet preprocessing: resize shorter side to 256, center-crop 224.
+  const canvas = $("preview"), ctx = canvas.getContext("2d", { willReadFrequently: true });
+  const scale = 256 / Math.min(img.width, img.height);
+  const crop = 224 / scale;
+  ctx.drawImage(img, (img.width - crop) / 2, (img.height - crop) / 2, crop, crop, 0, 0, 224, 224);
+  const px = ctx.getImageData(0, 0, 224, 224).data;
+  const x = new Float32Array(3 * 224 * 224);  // CHW, normalized
+  for (let i = 0; i < 224 * 224; i++) {
+    for (let c = 0; c < 3; c++) x[c * 224 * 224 + i] = (px[i * 4 + c] / 255 - MEAN[c]) / STD[c];
+  }
+  $("result").hidden = false;
+  const t0 = performance.now();
+  try {
+    const r = await fetch("/v1/infer", { method: "POST", body: x.buffer,
+                                         headers: { "Content-Type": "application/octet-stream" } });
+    if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
+    const res = await r.json();
+    const ms = performance.now() - t0;
+    $("bars").innerHTML = res.top_k.map((p, k) => `
+      <div class="bar ${k === 0 ? "top" : ""}">
+        <div class="lbl"><span>${labels[p.class] || "class " + p.class}</span><span>${(p.prob * 100).toFixed(1)}%</span></div>
+        <div class="track"><div class="fill" style="width:${Math.max(p.prob * 100, 0.5)}%"></div></div>
+      </div>`).join("");
+    $("timing").textContent = `Round trip ${ms.toFixed(1)} ms · ran in a batch of ${res.batch_size} · ` +
+      `waited ${(res.queue_us / 1000).toFixed(1)} ms · model ${(res.compute_us / 1000).toFixed(1)} ms`;
+  } catch (e) {
+    $("inferErr").textContent = "Inference failed: " + e.message;
+  }
+}
+
+// ---------- load test ----------
+const conn = $("conn");
+const connCount = () => CONN_STEPS[+conn.value];
+conn.addEventListener("input", () => $("connVal").textContent = connCount());
+document.querySelectorAll(".presets button").forEach(b => b.addEventListener("click", () => {
+  conn.value = b.dataset.c; $("connVal").textContent = connCount();
+}));
+let loadTotal = 15;
+$("go").addEventListener("click", async () => {
+  const c = connCount();
+  loadTotal = 15;
+  const r = await (await fetch(`/demo/load?connections=${c}&seconds=15`, { method: "POST" })).json();
+  if (!r.started) $("loadHint").textContent = r.reason || "Could not start the load test.";
+  setLoadState(r.load_running, r.load_remaining_s, r.load_connections);
+});
+function setLoadState(running, remaining, connections) {
+  $("go").disabled = running;
+  $("go").textContent = running ? `Running ${connections} users… ${Math.ceil(remaining)} s` : "Run for 15 s";
+  $("prog").style.width = running ? `${100 * (1 - remaining / loadTotal)}%` : "0%";
+}
+
+// ---------- live stats ----------
+function fmt(v, d = 1) { return Number.isFinite(v) ? v.toFixed(d) : "–"; }
+async function poll() {
+  try {
+    const s = await (await fetch("/stats?window=2")).json();
+    const now = new Date();
+    series.t.push(now); series.tput.push(s.throughput_rps);
+    series.p50.push(s.latency_ms.count ? s.latency_ms.p50 : null);
+    series.p99.push(s.latency_ms.count ? s.latency_ms.p99 : null);
+    for (const k of Object.keys(series)) if (series[k].length > HISTORY) series[k].shift();
+    lastHist = s.batching.batch_sizes;
+
+    $("kTput").innerHTML = `${Math.round(s.throughput_rps).toLocaleString()}<small>req/s</small>`;
+    $("kP50").innerHTML = s.latency_ms.count ? `${fmt(s.latency_ms.p50)}<small>ms</small>` : "–";
+    $("kP99").innerHTML = s.latency_ms.count ? `${fmt(s.latency_ms.p99)}<small>ms</small>` : "–";
+    $("kBatch").innerHTML = s.batching.batches ? `${fmt(s.batching.avg_batch_size)}<small>/ ${maxBatch}</small>` : "–";
+    $("kQueue").textContent = s.queue_depth;
+    $("kConn").textContent = s.connections;
+    drawLines("cTput", "tTput", [{ data: series.tput, color: "var(--blue)", name: "req/s", d: 0 }]);
+    drawLines("cLat", "tLat", [{ data: series.p50, color: "var(--blue)", name: "p50", d: 1, unit: " ms" },
+                               { data: series.p99, color: "var(--orange)", name: "p99", d: 1, unit: " ms" }]);
+    drawHist();
+  } catch (e) { /* server restarting: keep polling */ }
+}
+
+// ---------- tiny SVG charts ----------
+const NS = "http://www.w3.org/2000/svg";
+function el(tag, attrs, parent) {
+  const n = document.createElementNS(NS, tag);
+  for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, v);
+  if (parent) parent.appendChild(n);
+  return n;
+}
+function niceMax(v) {
+  if (!(v > 0)) return 1;
+  const p = Math.pow(10, Math.floor(Math.log10(v)));
+  for (const m of [1, 2, 2.5, 5, 10]) if (v <= m * p) return m * p;
+  return 10 * p;
+}
+function frame(svg) {
+  const W = svg.clientWidth || 320, H = svg.clientHeight || 170;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.innerHTML = "";
+  return { W, H, L: 40, R: 8, T: 8, B: 20 };
+}
+function drawLines(id, tipId, lines) {
+  const svg = $(id), f = frame(svg);
+  const all = lines.flatMap(l => l.data.filter(v => v != null));
+  const ymax = niceMax(Math.max(1, ...all));
+  const n = HISTORY;
+  const X = (i, len) => f.L + (f.W - f.L - f.R) * (n - len + i) / (n - 1);
+  const Y = (v) => f.T + (f.H - f.T - f.B) * (1 - v / ymax);
+  for (let k = 0; k <= 4; k++) {
+    const v = ymax * k / 4, y = Y(v);
+    el("line", { x1: f.L, x2: f.W - f.R, y1: y, y2: y, stroke: "var(--grid)", "stroke-width": 1 }, svg);
+    el("text", { x: f.L - 6, y: y + 3, "text-anchor": "end" }, svg).textContent =
+      v >= 1000 ? (v / 1000) + "k" : +v.toFixed(1);
+  }
+  el("text", { x: f.L, y: f.H - 4 }, svg).textContent = `−${HISTORY}s`;
+  el("text", { x: f.W - f.R, y: f.H - 4, "text-anchor": "end" }, svg).textContent = "now";
+  for (const l of lines) {
+    let d = "", pen = false;
+    l.data.forEach((v, i) => {
+      if (v == null) { pen = false; return; }
+      d += `${pen ? "L" : "M"}${X(i, l.data.length).toFixed(1)},${Y(v).toFixed(1)}`; pen = true;
+    });
+    el("path", { d, fill: "none", stroke: l.color, "stroke-width": 2, "stroke-linejoin": "round" }, svg);
+  }
+  // Hover: crosshair + readout of every series at that time.
+  const cross = el("line", { y1: f.T, y2: f.H - f.B, stroke: "var(--muted)", "stroke-dasharray": "3 3", visibility: "hidden" }, svg);
+  const hit = el("rect", { x: f.L, y: 0, width: f.W - f.L - f.R, height: f.H, fill: "transparent" }, svg);
+  const len = lines[0].data.length;
+  const showLatest = () => {
+    $(tipId).textContent = len ? "Latest: " + lines.map(l => `${l.name} ${fmt(l.data[len - 1], l.d)}${l.unit || ""}`).join(" · ") : "";
+  };
+  hit.addEventListener("mousemove", (e) => {
+    const r = svg.getBoundingClientRect();
+    const px = (e.clientX - r.left) * f.W / r.width;
+    let i = Math.round((px - f.L) / (f.W - f.L - f.R) * (n - 1)) - (n - len);
+    i = Math.max(0, Math.min(len - 1, i));
+    if (len === 0) return;
+    const x = X(i, len);
+    cross.setAttribute("x1", x); cross.setAttribute("x2", x); cross.setAttribute("visibility", "visible");
+    const ago = Math.round((series.t[series.t.length - 1] - series.t[i]) / 1000);
+    $(tipId).textContent = `${ago}s ago: ` + lines.map(l => `${l.name} ${fmt(l.data[i], l.d)}${l.unit || ""}`).join(" · ");
+  });
+  hit.addEventListener("mouseleave", () => { cross.setAttribute("visibility", "hidden"); showLatest(); });
+  showLatest();
+}
+function drawHist() {
+  const svg = $("cHist"), f = frame(svg);
+  const counts = Array.from({ length: maxBatch }, (_, i) => lastHist[String(i + 1)] || 0);
+  const total = counts.reduce((a, b) => a + b, 0);
+  const ymax = niceMax(Math.max(1, ...counts));
+  const bw = (f.W - f.L - f.R) / maxBatch;
+  const Y = (v) => f.T + (f.H - f.T - f.B) * (1 - v / ymax);
+  for (let k = 0; k <= 4; k++) {
+    const v = ymax * k / 4, y = Y(v);
+    el("line", { x1: f.L, x2: f.W - f.R, y1: y, y2: y, stroke: "var(--grid)", "stroke-width": 1 }, svg);
+    el("text", { x: f.L - 6, y: y + 3, "text-anchor": "end" }, svg).textContent = +v.toFixed(1);
+  }
+  counts.forEach((c, i) => {
+    const x = f.L + i * bw + 1, y = Y(c), h = f.H - f.B - y;
+    if (c > 0) el("rect", { x, y, width: Math.max(bw - 2, 1), height: h, rx: Math.min(4, bw / 3), fill: "var(--blue)" }, svg);
+    if (maxBatch <= 16 || (i + 1) % 4 === 0 || i === 0) {
+      el("text", { x: x + bw / 2 - 1, y: f.H - 6, "text-anchor": "middle" }, svg).textContent = i + 1;
+    }
+    const hit = el("rect", { x: f.L + i * bw, y: f.T, width: bw, height: f.H - f.T - f.B, fill: "transparent" }, svg);
+    hit.addEventListener("mousemove", () => $("tHist").textContent =
+      `Batch size ${i + 1}: ${c} batches (${total ? Math.round(100 * c / total) : 0}%)`);
+    hit.addEventListener("mouseleave", () => $("tHist").textContent = histSummary(counts, total));
+  });
+  $("tHist").textContent = histSummary(counts, total);
+}
+function histSummary(counts, total) {
+  if (!total) return "No batches in the last 2 s";
+  const full = counts[maxBatch - 1];
+  return `${total} batches · ${Math.round(100 * full / total)}% full (size ${maxBatch})`;
+}
+
+refreshInfo();
+setInterval(refreshInfo, 1000);
+poll();
+setInterval(poll, 1000);
+</script>
+</body>
+</html>

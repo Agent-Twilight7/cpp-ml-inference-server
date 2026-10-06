@@ -63,6 +63,7 @@ add_library(infer_core STATIC
     src/net/http_server.cpp
     src/runtime/onnx_backend.cpp
     src/server/inference_service.cpp
+    src/server/web_demo.cpp
 )
 target_include_directories(infer_core PUBLIC include)
 target_link_libraries(infer_core PUBLIC onnxruntime Threads::Threads)

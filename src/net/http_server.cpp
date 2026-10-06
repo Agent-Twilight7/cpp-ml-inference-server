@@ -55,6 +55,26 @@ int make_listener(const std::string& host, std::uint16_t port) {
     return fd;
 }
 
+// SO_REUSEPORT lets *any* process of the same user join a port, so a second
+// server instance would silently get half the connections. Binding once
+// without SO_REUSEPORT fails if anything already listens there.
+void ensure_port_free(const std::string& host, std::uint16_t port) {
+    int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) throw_errno("socket");
+    const int one = 1;
+    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));  // ignore TIME_WAIT leftovers
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    ::inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
+    const int rc = ::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    const int err = errno;
+    ::close(fd);
+    if (rc < 0 && err == EADDRINUSE) {
+        throw std::runtime_error("port " + std::to_string(port) + " is already in use by another process");
+    }
+}
+
 std::uint16_t local_port(int fd) {
     sockaddr_in addr{};
     socklen_t len = sizeof(addr);
@@ -408,6 +428,7 @@ void HttpServer::start() {
 
     // The first bind resolves port 0; the rest join that port via SO_REUSEPORT.
     std::uint16_t port = opts_.port;
+    if (port != 0) ensure_port_free(opts_.host, port);
     for (int i = 0; i < opts_.num_reactors; ++i) {
         const int fd = make_listener(opts_.host, port);
         if (i == 0) port = local_port(fd);
