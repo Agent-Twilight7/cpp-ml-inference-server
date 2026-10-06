@@ -116,8 +116,13 @@ Python client, so treat cross-phase numbers as indicative):
 | Step | Throughput | p99 |
 |---|---:|---:|
 | Unbatched baseline (Phase 2/3) | 665 req/s | 126 ms |
-| + dynamic batching (Phase 3) | 297 → 1,537 req/s after fixing [shape-change thrash](#model-runtime-srcruntime) | 49 ms |
+| + dynamic batching with batch-size buckets (Phase 3) | 1,537 req/s | 49 ms |
 | + pinned, pooled memory (Phase 4) | 1,912 req/s | 42 ms |
+
+The batch-size bucket fix mattered most at moderate load, where batch sizes
+vary from run to run. At 16 clients it took batched throughput from 297 to
+1,184 req/s ([details](#model-runtime-srcruntime)). At 64 clients batches are
+almost always full (same shape), so it changed little there.
 
 ---
 
@@ -669,7 +674,8 @@ Both images were built and tested. Inside Docker (Docker Desktop on WSL2) the
 CUDA image serves **1,633 req/s at p99 41.7 ms** with 64 connections (close to
 native), and `docker stop` triggers the graceful drain (`drained cleanly`,
 exit 0). The CUDA runtime in the base image must be recent enough for the ONNX
-Runtime build: ORT 1.30 needs CUDA 12.8+ (12.6 fails to load the CUDA provider).
+Runtime build: with ORT 1.30, a CUDA 12.9 base works while 12.6 fails to load the
+CUDA provider (missing `cudaLibraryGetKernel`).
 
 **Prometheus + Grafana.** `docker compose up --build` starts the server,
 Prometheus scraping `/metrics` every 2 s, and Grafana at
@@ -711,6 +717,7 @@ The full suite (concurrency sweep, offered-load sweep, delay sweep, CPU
 comparison) and the charts:
 
 ```bash
+. scripts/env_cuda.sh                                        # GPU runs need the CUDA libraries on the path
 python bench/run_benchmarks.py --build ~/builds/infer-cuda   # ~10 min, writes bench/results/*.json
 python bench/plot_results.py                                 # writes docs/images/*.png
 ```
