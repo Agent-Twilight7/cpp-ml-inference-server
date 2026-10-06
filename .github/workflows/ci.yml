@@ -1,0 +1,57 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: release (gcc)
+            cc: gcc
+            cxx: g++
+            cmake_flags: -DCMAKE_BUILD_TYPE=Release
+            launcher: ""
+          - name: asan + ubsan (gcc)
+            cc: gcc
+            cxx: g++
+            cmake_flags: -DCMAKE_BUILD_TYPE=Debug -DINFER_ENABLE_ASAN=ON
+            launcher: ""
+          # clang: GCC 11's TSan runtime misses pthread_cond_clockwait (false positives).
+          # setarch -R: TSan needs ASLR off on kernels with high mmap entropy.
+          - name: tsan (clang)
+            cc: clang
+            cxx: clang++
+            cmake_flags: -DCMAKE_BUILD_TYPE=Debug -DINFER_ENABLE_TSAN=ON
+            launcher: setarch x86_64 -R
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: Cache ONNX Runtime
+        uses: actions/cache@v4
+        with:
+          path: third_party/onnxruntime
+          key: onnxruntime-1.30.0-cpu
+
+      - name: Fetch ONNX Runtime
+        run: bash scripts/fetch_onnxruntime.sh
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja ${{ matrix.cmake_flags }}
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Unit tests
+        run: ${{ matrix.launcher }} ./build/unit_tests --gtest_color=yes

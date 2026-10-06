@@ -12,7 +12,11 @@ namespace {
 // deliberately never destroyed: tearing it down during static destruction can
 // run after the CUDA runtime has already unloaded and abort the process at exit.
 Ort::Env& ort_env() {
-    static Ort::Env* env = new Ort::Env{ORT_LOGGING_LEVEL_WARNING, "infer"};
+    static Ort::Env* env = [] {
+        auto* e = new Ort::Env{ORT_LOGGING_LEVEL_WARNING, "infer"};
+        e->DisableTelemetryEvents();
+        return e;
+    }();
     return *env;
 }
 

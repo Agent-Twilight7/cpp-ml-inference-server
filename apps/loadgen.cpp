@@ -267,6 +267,8 @@ int main(int argc, char** argv) {
                     const auto r = conn.roundtrip(request);
                     const auto t1 = Clock::now();
                     if (t0 >= measure_from) stats.record(r, micros(t1 - t0));
+                    // Server unreachable (e.g. shut down): back off instead of spinning.
+                    if (r.status == 0) std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 }
             } else {
                 for (;;) {

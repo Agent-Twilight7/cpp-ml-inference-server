@@ -1,0 +1,36 @@
+# Server + Prometheus + Grafana with a ready-made dashboard.
+#   python models/export_resnet.py      # once, creates models/resnet18.onnx
+#   docker compose up --build
+#   open http://localhost:3000          # Grafana (anonymous viewer), dashboard "Inference Server"
+#   ./build/loadgen --port 8080 --mode open --rate 50 --duration 120
+# For the GPU image: INFER_DOCKERFILE=Dockerfile.cuda docker compose -f docker-compose.yml -f deploy/compose.gpu.yml up --build
+
+services:
+  server:
+    build:
+      context: .
+      dockerfile: ${INFER_DOCKERFILE:-Dockerfile}
+    ports:
+      - "${INFER_PORT:-8080}:8080"  # host port: INFER_PORT=18080 docker compose up ...
+    stop_grace_period: 15s  # time for the graceful drain
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on: [server]
+
+  grafana:
+    image: grafana/grafana:11.3.1
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/inference.json
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on: [prometheus]

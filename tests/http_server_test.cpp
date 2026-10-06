@@ -33,6 +33,14 @@ protected:
                 r.send(HttpResponse::text(200, "later"));
             });
         });
+        // Slower async route, for drain tests.
+        server_->route("GET", "/slow", [this](HttpRequest&&, Responder r) {
+            std::lock_guard lock(workers_mu_);
+            workers_.emplace_back([r] {
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                r.send(HttpResponse::text(200, "slow"));
+            });
+        });
         server_->start();
     }
 
@@ -157,4 +165,26 @@ TEST_F(HttpServerTest, ManyConcurrentClients) {
     }
     for (auto& t : clients) t.join();
     EXPECT_EQ(ok.load(), kClients * kRequestsEach);
+}
+
+TEST_F(HttpServerTest, GracefulDrainFinishesInFlightAndRefusesNew) {
+    Client idle(server_->port());
+    ASSERT_EQ(idle.request("GET", "/hello").status, 200);  // now an idle keep-alive connection
+
+    Client busy(server_->port());
+    busy.send_raw("GET /slow HTTP/1.1\r\n\r\n");
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));  // request is with the handler
+
+    server_->begin_drain();
+
+    auto r = busy.read_response();  // the in-flight request still completes...
+    EXPECT_EQ(r.status, 200);
+    EXPECT_EQ(r.body, "slow");
+    EXPECT_NE(r.head.find("Connection: close"), std::string::npos);  // ...as the connection's last
+    EXPECT_TRUE(busy.closed_by_peer());
+    EXPECT_TRUE(idle.closed_by_peer());  // idle connections are closed right away
+
+    Client fresh(server_->port());
+    EXPECT_FALSE(fresh.connected());  // listeners are closed: new connections refused
+    EXPECT_TRUE(server_->wait_drained(std::chrono::seconds(2)));
 }

@@ -99,7 +99,7 @@ public:
 
     ~Reactor() {
         for (auto& [id, conn] : conns_) ::close(conn->fd);
-        ::close(listen_fd_);
+        if (listen_fd_ >= 0) ::close(listen_fd_);
         ::close(wake_fd_);
         ::close(epoll_fd_);
     }
@@ -125,11 +125,19 @@ public:
                 }
             }
             drain_local();
+            if (!draining_ && drain_requested_.load(std::memory_order_acquire)) start_draining();
         }
     }
 
     void stop() {
         stopping_.store(true, std::memory_order_release);
+        wake();
+    }
+
+    // Thread-safe. Graceful shutdown: stop accepting, close idle connections,
+    // and close the rest as soon as their in-flight response is written.
+    void begin_drain() {
+        drain_requested_.store(true, std::memory_order_release);
         wake();
     }
 
@@ -164,7 +172,23 @@ private:
         [[maybe_unused]] ssize_t r = ::write(wake_fd_, &one, sizeof(one));
     }
 
+    void start_draining() {
+        draining_ = true;
+        ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, listen_fd_, nullptr);
+        ::close(listen_fd_);  // new connections to this port are now refused
+        listen_fd_ = -1;
+        // Idle keep-alive connections have nothing in flight: close them now.
+        std::vector<std::uint64_t> idle;
+        for (const auto& [id, c] : conns_) {
+            if (!c->busy && c->in.empty() && c->out_off >= c->out.size()) idle.push_back(id);
+        }
+        for (std::uint64_t id : idle) {
+            if (Connection* c = find(id)) close_conn(*c);
+        }
+    }
+
     void on_accept() {
+        if (listen_fd_ < 0) return;
         for (;;) {
             const int fd = ::accept4(listen_fd_, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
             if (fd < 0) {
@@ -294,7 +318,8 @@ private:
     void deliver(std::uint64_t id, const HttpResponse& resp) {
         Connection* c = find(id);
         if (!c || !c->busy) return;  // client went away (or a duplicate send)
-        if (!write_response(*c, resp, c->keep_alive)) return;
+        // While draining, every response is the connection's last.
+        if (!write_response(*c, resp, c->keep_alive && !draining_)) return;
         c->busy = false;
         // Resume: drain the socket if we paused it, then handle pipelined requests.
         if (c->read_paused && !read_input(*c)) return;
@@ -350,6 +375,8 @@ private:
     int wake_fd_ = -1;
     HttpParser::Limits limits_;
     std::atomic<bool> stopping_{false};
+    std::atomic<bool> drain_requested_{false};
+    bool draining_ = false;  // loop thread only
     std::atomic<std::thread::id> loop_thread_{};
     std::atomic<std::size_t> active_{0};      // read by metrics from other threads
     std::atomic<std::uint64_t> accepted_{0};
@@ -404,6 +431,19 @@ void HttpServer::stop() {
     }
     threads_.clear();
     reactors_.clear();
+}
+
+void HttpServer::begin_drain() {
+    for (auto& r : reactors_) r->begin_drain();
+}
+
+bool HttpServer::wait_drained(std::chrono::milliseconds timeout) const {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (active_connections() > 0) {
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return true;
 }
 
 std::size_t HttpServer::active_connections() const {

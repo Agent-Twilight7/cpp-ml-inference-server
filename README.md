@@ -1,14 +1,27 @@
 # C++ ML Inference Server
 
-A model-serving server written from scratch in C++20: a custom **epoll HTTP/1.1
-stack**, **dynamic batching** (the technique behind NVIDIA Triton and vLLM),
-preallocated memory pools, ONNX Runtime execution on CPU or **CUDA GPU**, and a
-metrics endpoint with p50/p99 latency, throughput, queue depth and batch sizes.
+A GPU model-serving server written from scratch in C++20, in the spirit of
+NVIDIA Triton: a custom **epoll HTTP/1.1 stack**, **dynamic batching**,
+**lock-free memory pools** with pinned host memory, ONNX Runtime execution on
+CPU or **CUDA**, built-in **p50/p99 latency, throughput, queue-depth and
+batch-size metrics** (JSON + Prometheus), graceful shutdown, Docker images
+and CI with sanitizers.
 
-> **Status: Phase 6 done.** On one laptop GPU, dynamic batching sustains
-> **3× the load of unbatched serving at the same 30 ms p99** (1,500 vs 500
-> req/s), and peaks at ~1,800 req/s (2.7×). Next: graceful shutdown, Docker,
-> CI. See [Roadmap](#roadmap).
+**Highlights** (ResNet-18 on one RTX 4060 Laptop GPU; details in [Results](#results)):
+
+- **3× the sustainable load at the same tail latency:** 1,500 req/s at p99 ≤ 30 ms
+  with dynamic batching vs ~500 req/s without; peak ~1,800 req/s (2.7×).
+- **No networking or concurrency libraries:** multi-reactor edge-triggered
+  `epoll`, `SO_REUSEPORT` listeners, cross-thread completion via `eventfd`.
+- **Lock-free where it matters:** Treiber-stack buffer pool with ABA tagging,
+  wait-free HDR-style histograms, no locks on the metrics hot path.
+- **Measured, not guessed:** an open-loop (coordinated-omission-safe) C++ load
+  generator; profiling via the server's own metrics found a **30 ms-per-batch
+  ONNX Runtime shape-change penalty** whose fix raised throughput 4×.
+- **Tested:** 57 GoogleTest tests over real sockets and a fake model, clean
+  under **AddressSanitizer, UBSan and ThreadSanitizer**, in GitHub Actions CI.
+
+![Throughput and p99 latency vs concurrency](docs/images/concurrency.png)
 
 ---
 
@@ -23,11 +36,15 @@ metrics endpoint with p50/p99 latency, throughput, queue depth and batch sizes.
   - [Memory: pools and the data path](#memory-pools-and-the-data-path-srcmemory)
   - [Metrics](#metrics-srcmetrics-srcserver)
   - [Model runtime](#model-runtime-srcruntime)
+  - [Graceful shutdown](#graceful-shutdown)
 - [API](#api)
 - [Build and run](#build-and-run)
+- [Deployment: Docker, Prometheus, Grafana, CI](#deployment-docker-prometheus-grafana-ci)
 - [Benchmarking](#benchmarking)
 - [Testing](#testing)
 - [Project layout](#project-layout)
+- [Design lessons](#design-lessons)
+- [Limitations and future work](#limitations-and-future-work)
 - [Roadmap](#roadmap)
 
 ---
@@ -39,9 +56,8 @@ and load generator on the same machine (WSL2, 24 logical cores). Every request
 carries one 602 KB image. Measured with the bundled C++ load generator
 (`loadgen`) via `bench/run_benchmarks.py`; raw data is in `bench/results/`.
 "No batching" is the same server with `--max-batch 1 --workers 4`. "Dynamic
-batching" is `--max-batch 16 --max-delay-us 2000 --workers 2`.
-
-![Throughput and p99 latency vs concurrency](docs/images/concurrency.png)
+batching" is `--max-batch 16 --max-delay-us 2000 --workers 2`. (Chart at the
+top of this page.)
 
 **Closed loop** (each connection sends its next request when the last one
 returns):
@@ -148,7 +164,7 @@ sequenceDiagram
 
 ### Target design
 
-Components marked ✅ are implemented; the rest are upcoming phases.
+Every component in this diagram is implemented (✅).
 
 ```mermaid
 flowchart LR
@@ -512,6 +528,37 @@ dimension and saves a reference batch. `ort_smoke` checks C++ outputs against
 PyTorch: max difference 5e-6 on CPU, 5e-3 on GPU (TF32 convolutions), with
 identical top-1 classes.
 
+### Graceful shutdown
+
+`SIGTERM` (what Docker and Kubernetes send) and `SIGINT` are blocked in every
+thread and received synchronously by `main` via `sigwait`, so no
+async-signal-safety problems arise. Shutdown then drains instead of dropping
+work:
+
+```mermaid
+sequenceDiagram
+    participant OS as SIGTERM
+    participant M as main
+    participant S as InferenceService
+    participant H as HttpServer (reactors)
+    participant B as DynamicBatcher
+    OS->>M: sigwait returns
+    M->>S: set_draining: /health now 503 (LB stops routing)
+    M->>H: begin_drain: close listeners, close idle keep-alive conns
+    M->>B: stop: refuse new work, run everything queued
+    B-->>H: last responses (sent with Connection: close)
+    M->>H: wait_drained(timeout): until all connections closed
+    M->>H: stop reactors, join threads
+```
+
+Busy connections finish their in-flight request and close right after it.
+Order matters: the batcher stops before the reactors, because its callbacks
+deliver through them. Measured on the GPU server under 64 connections of load,
+SIGTERM to exit took 1.3 s with no failed in-flight requests. The drain is
+bounded by `--drain-timeout-ms` (default 10 s). A unit test covers it: an
+in-flight request completes with `Connection: close`, idle connections are
+closed, and new connections are refused.
+
 ---
 
 ## API
@@ -597,6 +644,44 @@ cmake --build build-cuda
 | `--queue-timeout-ms` | `0` (off) | fail requests that waited longer with 504 |
 | `--buckets` | `auto` | batch-size buckets: `auto` (powers of two on CUDA, none on CPU), `none`, or a list like `1,4,16` |
 | `--pinned` | `1` | CUDA pinned batch buffers (`0` = pageable, for comparison) |
+| `--drain-timeout-ms` | `10000` | graceful-shutdown budget for in-flight requests |
+
+---
+
+## Deployment: Docker, Prometheus, Grafana, CI
+
+**Docker.** Multi-stage images: the build stage compiles against the prebuilt
+ONNX Runtime, and the runtime stage holds just the binaries, `libonnxruntime`
+and the model, running as a non-root user with a `HEALTHCHECK` on `/health`.
+The CUDA image is based on `nvidia/cuda:*-cudnn-runtime` and needs no CUDA
+toolkit to build.
+
+```bash
+python models/export_resnet.py                      # the image bundles models/resnet18.onnx
+docker build -t inference-server .                  # CPU
+docker run --rm -p 8080:8080 inference-server
+
+docker build -f Dockerfile.cuda -t inference-server:cuda .
+docker run --rm --gpus all -p 8080:8080 inference-server:cuda
+```
+
+Both images were built and tested. Inside Docker (Docker Desktop on WSL2) the
+CUDA image serves **1,633 req/s at p99 41.7 ms** with 64 connections (close to
+native), and `docker stop` triggers the graceful drain (`drained cleanly`,
+exit 0). The CUDA runtime in the base image must be recent enough for the ONNX
+Runtime build: ORT 1.30 needs CUDA 12.8+ (12.6 fails to load the CUDA provider).
+
+**Prometheus + Grafana.** `docker compose up --build` starts the server,
+Prometheus scraping `/metrics` every 2 s, and Grafana at
+<http://localhost:3000> with a provisioned **Inference Server** dashboard:
+throughput, p50/p99/p99.9 latency, queue-wait vs compute time, average batch
+size, queue depth and in-flight requests, error rates by status, pool usage and
+padding waste. If port 8080 is taken, use `INFER_PORT=18080 docker compose up --build`. GPU variant:
+`INFER_DOCKERFILE=Dockerfile.cuda docker compose -f docker-compose.yml -f deploy/compose.gpu.yml up --build`.
+
+**CI.** `.github/workflows/ci.yml` builds and runs the unit tests in three
+configurations on every push: release (GCC), AddressSanitizer + UBSan (GCC),
+and ThreadSanitizer (clang).
 
 ---
 
@@ -658,6 +743,8 @@ ctest --test-dir build --output-on-failure      # or ./build/unit_tests
   callers gets its own result; padding rows are ignored; 503 when the queue is
   full; `stop()` drains without waiting; backend failure fails the whole
   batch; queue timeouts; and 8 producers × 3 workers × 1,600 requests.
+- **Graceful drain:** in-flight request completes with `Connection: close`,
+  idle connections close, new connections are refused.
 - **Sanitizers:** the same suite under AddressSanitizer + UBSan
   (`-DINFER_ENABLE_ASAN=ON`) and ThreadSanitizer (`-DINFER_ENABLE_TSAN=ON`).
 
@@ -696,8 +783,55 @@ ctest --test-dir build --output-on-failure      # or ./build/unit_tests
 ├── docs/images/               benchmark charts
 ├── models/                    export_resnet.py (PyTorch → ONNX + reference data)
 ├── scripts/                   environment setup, CUDA env, infer_client.py
+├── deploy/                    Prometheus config, Grafana provisioning + dashboard
+├── Dockerfile, Dockerfile.cuda, docker-compose.yml
+├── .github/workflows/ci.yml   build + tests: release, ASan/UBSan, TSan
 └── third_party/               ONNX Runtime (downloaded, git-ignored)
 ```
+
+---
+
+## Design lessons
+
+Things that only showed up by measuring or testing, each now covered by a test
+or documented:
+
+- **Shapes cost more than batch size.** ONNX Runtime's CUDA convolutions redo
+  per-layer setup whenever a session sees a new input shape (~30 ms for
+  ResNet-18). Varying batch sizes thrashed it until each bucket got its own
+  session. Found by having the server report `compute_us` per request.
+- **Pageable vs pinned memory is worth 23%.** At full load the host→device
+  copies of 16 × 602 KB per batch matter; page-locked buffers let the GPU DMA
+  directly.
+- **ADL can silently bypass your code.** A helper named `invoke(callback, ...)`
+  was never called: argument-dependent lookup on `std::function` picked
+  `std::invoke`, skipping the helper's exception guard. A compiler "unused
+  function" warning was the only clue.
+- **Static destruction order and CUDA.** A function-local static `Ort::Env`
+  can be destroyed after the CUDA runtime unloads at exit. It is intentionally
+  leaked.
+- **Sanitizer false positives are toolchain bugs, not your bugs:** GCC 11's
+  TSan doesn't intercept `pthread_cond_clockwait` (used by
+  `condition_variable::wait_until` on `steady_clock`), so it reported a phantom
+  double lock. Clang's TSan is clean.
+- **Batching has a cost at low load.** At one connection, a lone request waits
+  the full batching delay. That's the price of capacity under load, made
+  explicit in the results instead of hidden.
+
+## Limitations and future work
+
+- **One model per process**, fixed input shape (dynamic batch dimension only).
+  Multi-model routing and model versioning would follow the Triton model
+  repository pattern.
+- **HTTP/1.1 only**, no TLS (expected behind a proxy or load balancer). A
+  gRPC/HTTP-2 frontend could reuse the batcher unchanged.
+- **Adaptive batching delay:** skip the wait when the GPU is idle and no other
+  request is in flight. This would remove the single-client latency penalty.
+- **CUDA graphs** per batch bucket (the shapes are already static per session)
+  and **TensorRT / FP16** would cut per-batch GPU time further.
+- **Benchmark caveats:** client and server share one machine, and a laptop GPU
+  changes clocks with load and temperature. Numbers are representative, not
+  datacenter figures.
 
 ---
 
@@ -710,4 +844,4 @@ ctest --test-dir build --output-on-failure      # or ./build/unit_tests
 - [x] Phase 4: memory pools (no per-request tensor allocation) + pinned memory
 - [x] Phase 5: `/metrics` (Prometheus) and `/stats` (JSON)
 - [x] Phase 6: C++ load generator (closed + open loop) and benchmark suite with charts
-- [ ] Phase 7: Docker, CI, graceful shutdown
+- [x] Phase 7: graceful shutdown (drain), Docker images, Prometheus + Grafana, GitHub Actions CI

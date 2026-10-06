@@ -2,6 +2,7 @@
 
 #include "infer/net/http.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -62,6 +63,15 @@ public:
     void start();
     // Stops all reactors and joins their threads. Idempotent.
     void stop();
+
+    // Graceful shutdown, step 1 (thread-safe): close the listening sockets so
+    // new connections are refused, close idle keep-alive connections, and
+    // close every other connection right after its in-flight response is
+    // written (with "Connection: close").
+    void begin_drain();
+    // Step 2: wait until every connection has closed, or `timeout` passes.
+    // Returns true if fully drained. Then call stop().
+    bool wait_drained(std::chrono::milliseconds timeout) const;
 
     // The bound port (resolves port 0 after start()).
     std::uint16_t port() const { return bound_port_; }

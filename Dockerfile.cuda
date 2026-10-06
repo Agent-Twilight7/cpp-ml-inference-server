@@ -1,0 +1,39 @@
+# NVIDIA GPU image (needs the NVIDIA Container Toolkit, or Docker Desktop + WSL2).
+#   docker build -f Dockerfile.cuda -t inference-server:cuda .
+#   docker run --rm --gpus all -p 8080:8080 inference-server:cuda
+
+# ---- build stage: no CUDA toolkit needed, ORT is linked as a prebuilt library ----
+FROM ubuntu:22.04 AS build
+ARG ORT_VERSION=1.30.0
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends build-essential cmake ninja-build curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY scripts/fetch_onnxruntime.sh scripts/
+RUN ORT_FLAVOR=gpu ORT_VERSION=${ORT_VERSION} bash scripts/fetch_onnxruntime.sh
+COPY CMakeLists.txt .
+COPY include include
+COPY src src
+COPY apps apps
+RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DINFER_BUILD_TESTS=OFF -DINFER_ENABLE_CUDA=ON \
+ && cmake --build build --target inference_server loadgen
+
+# ---- runtime stage: CUDA 12.9 runtime + cuDNN 9 ----
+# ORT 1.30's CUDA provider needs a recent CUDA 12 runtime (12.6 lacks
+# cudaLibraryGetKernel), so keep this in step with the ORT version.
+FROM nvidia/cuda:12.9.1-cudnn-runtime-ubuntu22.04
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd --system --create-home app
+# libonnxruntime plus the CUDA execution provider it dlopen()s at runtime.
+COPY --from=build /src/third_party/onnxruntime-gpu/lib/libonnxruntime*.so* /usr/local/lib/
+RUN ldconfig
+COPY --from=build /src/build/inference_server /src/build/loadgen /usr/local/bin/
+COPY models/resnet18.onnx /models/resnet18.onnx
+USER app
+EXPOSE 8080
+STOPSIGNAL SIGTERM
+HEALTHCHECK --interval=10s --timeout=2s --start-period=60s CMD curl -fs http://localhost:8080/health || exit 1
+ENTRYPOINT ["inference_server", "--model", "/models/resnet18.onnx", "--port", "8080", "--device", "cuda"]
+CMD ["--workers", "2", "--max-batch", "16"]

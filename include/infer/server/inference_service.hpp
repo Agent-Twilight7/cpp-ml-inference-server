@@ -62,6 +62,8 @@ public:
     // Starts / stops the window ticker thread.
     void start();
     void stop();
+    // While draining, /health answers 503 so load balancers stop routing here.
+    void set_draining(bool draining) { draining_.store(draining, std::memory_order_relaxed); }
 
     const ServiceMetrics& metrics() const { return metrics_; }
     std::string render_stats_json(std::chrono::seconds window) const;
@@ -91,6 +93,7 @@ private:
 
     ServiceMetrics metrics_;
     std::atomic<std::int64_t> inflight_{0};
+    std::atomic<bool> draining_{false};
 
     mutable std::mutex ring_mu_;
     std::deque<Sample> ring_;  // oldest first

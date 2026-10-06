@@ -1,0 +1,11 @@
+# GPU override: docker compose -f docker-compose.yml -f deploy/compose.gpu.yml up --build
+# (with INFER_DOCKERFILE=Dockerfile.cuda)
+services:
+  server:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

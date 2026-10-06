@@ -86,8 +86,12 @@ InferenceService::~InferenceService() { stop(); }
 
 void InferenceService::install(net::HttpServer& server) {
     server_ = &server;
-    server.route("GET", "/health", [](net::HttpRequest&&, net::Responder r) {
-        r.send(net::HttpResponse::text(200, "ok\n"));
+    server.route("GET", "/health", [this](net::HttpRequest&&, net::Responder r) {
+        if (draining_.load(std::memory_order_relaxed)) {
+            r.send(net::HttpResponse::text(503, "draining\n"));
+        } else {
+            r.send(net::HttpResponse::text(200, "ok\n"));
+        }
     });
     server.route("POST", "/v1/infer", [this](net::HttpRequest&& req, net::Responder r) {
         handle_infer(std::move(req), r);

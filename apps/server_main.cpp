@@ -7,7 +7,7 @@
 //                    [--port 8080] [--reactors 2] [--workers 2] [--ort-threads 1]
 //                    [--max-batch 16] [--max-delay-us 2000]
 //                    [--queue-size 1024] [--queue-timeout-ms 0]
-//                    [--buckets auto] [--pinned 1]
+//                    [--buckets auto] [--pinned 1] [--drain-timeout-ms 10000]
 //
 // --max-batch 1 turns batching off (same pipeline, one request per run).
 // Endpoints: /health, /v1/infer, /stats, /metrics (see InferenceService).
@@ -43,13 +43,15 @@ struct Config {
     long queue_timeout_ms = 0;
     std::string buckets = "auto";  // "auto", "none", or e.g. "1,2,4,8,16"
     bool pinned = true;            // CUDA pinned batch buffers
+    long drain_timeout_ms = 10000;  // graceful shutdown budget
 };
 
 [[noreturn]] void usage(const char* argv0) {
     std::fprintf(stderr,
                  "usage: %s [--model PATH] [--device cpu|cuda] [--port N] [--reactors N] [--workers N]\n"
                  "          [--ort-threads N] [--max-batch N] [--max-delay-us N] [--queue-size N]\n"
-                 "          [--queue-timeout-ms N] [--buckets auto|none|N,N,...] [--pinned 0|1]\n",
+                 "          [--queue-timeout-ms N] [--buckets auto|none|N,N,...] [--pinned 0|1]\n"
+                 "          [--drain-timeout-ms N]\n",
                  argv0);
     std::exit(2);
 }
@@ -85,6 +87,8 @@ Config parse_args(int argc, char** argv) {
             cfg.buckets = value;
         } else if (flag == "--pinned") {
             cfg.pinned = value != "0";
+        } else if (flag == "--drain-timeout-ms") {
+            cfg.drain_timeout_ms = std::stol(value);
         } else {
             usage(argv[0]);
         }
@@ -195,10 +199,20 @@ int main(int argc, char** argv) {
 
         int sig = 0;
         sigwait(&signals, &sig);
-        std::fprintf(stderr, "received %s, shutting down\n", sig == SIGINT ? "SIGINT" : "SIGTERM");
-        // Batcher first: its callbacks send through the reactors, which must
-        // still be alive. New requests arriving meanwhile get 503.
+        std::fprintf(stderr, "received %s, draining (up to %ld ms)...\n", sig == SIGINT ? "SIGINT" : "SIGTERM",
+                     cfg.drain_timeout_ms);
+        // Graceful shutdown:
+        //  1. /health -> 503 so load balancers stop sending traffic here.
+        //  2. Stop accepting; close idle connections; busy ones close after
+        //     their response.
+        //  3. Finish every queued request (callbacks still deliver through the
+        //     live reactors); anything arriving now gets 503.
+        //  4. Wait for responses to flush, bounded by the drain timeout.
+        service.set_draining(true);
+        server.begin_drain();
         batcher.stop();
+        const bool drained = server.wait_drained(std::chrono::milliseconds(cfg.drain_timeout_ms));
+        std::fprintf(stderr, drained ? "drained cleanly\n" : "drain timeout: closing remaining connections\n");
         server.stop();
         service.stop();
     } catch (const std::exception& e) {

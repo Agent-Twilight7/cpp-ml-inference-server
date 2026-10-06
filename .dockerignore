@@ -1,0 +1,9 @@
+.git
+build*
+third_party
+bench/results
+docs
+**/__pycache__
+models/*.bin
+models/*.data
+*.md
