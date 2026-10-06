@@ -5,9 +5,11 @@ stack**, **dynamic batching** (the technique behind NVIDIA Triton and vLLM),
 preallocated memory pools, ONNX Runtime execution on CPU or **CUDA GPU**, and a
 metrics endpoint with p50/p99 latency, throughput, queue depth and batch sizes.
 
-> **Status: Phase 4 done.** Dynamic batching plus pinned, pooled memory serves
+> **Status: Phase 5 done.** Dynamic batching plus pinned, pooled memory serves
 > **1,912 req/s on one laptop GPU (2.9× unbatched), with p99 latency down from
-> 126 ms to 42 ms**. Next: metrics. See [Roadmap](#roadmap).
+> 126 ms to 42 ms**, and the server reports its own p50/p99, throughput, queue
+> depth and batch sizes at `/stats` and `/metrics`. Next: C++ load generator and
+> benchmarks. See [Roadmap](#roadmap).
 
 ---
 
@@ -20,6 +22,7 @@ metrics endpoint with p50/p99 latency, throughput, queue depth and batch sizes.
   - [Network layer](#network-layer-srcnet)
   - [Dynamic batcher](#dynamic-batcher-srcbatching)
   - [Memory: pools and the data path](#memory-pools-and-the-data-path-srcmemory)
+  - [Metrics](#metrics-srcmetrics-srcserver)
   - [Model runtime](#model-runtime-srcruntime)
 - [API](#api)
 - [Build and run](#build-and-run)
@@ -125,7 +128,7 @@ flowchart LR
         w2["Worker K<br/>ONNX Runtime session ✅"]
     end
 
-    m["Metrics<br/>/metrics, /stats (Phase 5)"]
+    m["Metrics ✅<br/>/metrics (Prometheus), /stats (JSON)"]
 
     c1 & c2 & c3 -->|"TCP (kernel load-balances<br/>via SO_REUSEPORT)"| r1 & r2
     r1 & r2 -->|push| q --> b
@@ -354,6 +357,69 @@ Pool tests include an 8-thread stress test hammering a 4-block pool
 ever held by two threads and that all blocks come back, and it passes under
 ThreadSanitizer.
 
+### Metrics (`src/metrics/`, `src/server/`)
+
+The server measures itself. `GET /stats` returns JSON over a sliding window
+(`?window=N` seconds, default 10, max 60). `GET /metrics` returns the same data
+in Prometheus text format. Here is `/stats` captured on the GPU server under
+48 concurrent clients:
+
+```json
+{
+  "window_s": 5.4, "uptime_s": 6.4,
+  "throughput_rps": 1771.1,
+  "requests": {"ok": 9624, "bad_request": 0, "rejected": 0, "timeouts": 0, "errors": 0},
+  "latency_ms":       {"count": 9624, "mean": 24.4, "p50": 24.4, "p90": 25.5, "p99": 27.5, "p999": 33.1, "max": 36.9},
+  "queue_wait_ms":    {"count": 9624, "mean": 6.8,  "p50": 6.8,  "p90": 7.9,  "p99": 8.6,  "p999": 20.2, "max": 22.5},
+  "batch_compute_ms": {"count": 608,  "mean": 15.9, "p50": 16.0, "p90": 16.3, "p99": 18.1, "p999": 22.9, "max": 23.6},
+  "batching": {"batches": 608, "avg_batch_size": 15.83, "padding_waste": 0.001,
+               "batch_sizes": {"2": 2, "3": 2, "4": 2, "6": 1, "8": 1, "10": 1, "14": 1, "16": 598}},
+  "queue_depth": 10, "inflight": 42, "connections": 49,
+  "request_pool": {"in_use": 10, "capacity": 1056, "high_watermark": 27}
+}
+```
+
+From this one response you can read off how the server spends its time.
+Requests wait ~7 ms for a batch, then the batch takes ~16 ms. 98% of batches
+are full, padding wastes 0.1% of GPU rows, and the request pool never needed
+more than 27 of its 1,056 blocks.
+
+| What | Kind | Where it's recorded |
+|---|---|---|
+| End-to-end latency (successful requests) | histogram | service: request parsed → response handed to reactor |
+| Queue wait | histogram | batcher, per request: submit → batch formed |
+| Batch compute | histogram | batcher, per batch: model `run()` |
+| Batch size, padding waste | exact histogram, counter | batcher, per batch |
+| Requests by status (200/400/500/503/504) | counters | service |
+| Queue depth, in-flight, active connections, pool usage | gauges | read live at scrape time |
+| Throughput | derived | ok-count delta ÷ window |
+
+**Lock-free log-linear histogram.** `LatencyHistogram` works like
+HdrHistogram. Values below 16 µs get exact buckets, and every power-of-two range
+above is split into 16 equal sub-buckets. So no bucket is wider than 1/16 of
+its lower edge, and percentiles are within **6.25%** from microseconds to
+minutes, using 592 buckets. `record()` is three relaxed `fetch_add`s: no lock,
+no CAS loop. A unit test checks p50 through p99.9 against exact values from a
+200,000-sample log-normal distribution.
+
+**Sliding windows without locking the hot path.** A ticker thread snapshots
+every histogram and counter once a second into a 60-second ring.
+Histograms subtract bucket-by-bucket, so the stats for "the last N seconds" are
+just `live snapshot − ring snapshot from N seconds ago`:
+
+```mermaid
+flowchart LR
+    rec["request / worker threads<br/>relaxed fetch_add only"] --> live[("live counters<br/>+ histograms")]
+    tick["ticker thread (1 Hz)"] -->|snapshot| ring[("ring: 60 s of snapshots")]
+    live --> q["/stats?window=N<br/>/metrics"]
+    ring -->|"snapshot from N s ago"| q
+    q -->|"live − old = window"| out["p50 / p99 / rps<br/>over the last N s"]
+```
+
+Latencies go to Prometheus as **summaries** with p50/p90/p99/p99.9 over the
+last 60 s, plus cumulative `_sum` and `_count` so `rate()` works. Batch size is
+a real Prometheus **histogram** with one bucket per size.
+
 ### Model runtime (`src/runtime/`)
 
 `ModelBackend` is the interface the server sees: run *B* samples from a
@@ -407,6 +473,8 @@ identical top-1 classes.
 | Method | Path | Body | Response |
 |---|---|---|---|
 | `GET` | `/health` | — | `ok` |
+| `GET` | `/stats` | `?window=N` (1–60 s, default 10) | JSON: windowed latency percentiles, throughput, batching, gauges ([example](#metrics-srcmetrics-srcserver)) |
+| `GET` | `/metrics` | — | Prometheus text exposition |
 | `POST` | `/v1/infer` | one image as raw little-endian float32, shape 3×224×224 (602,112 bytes), ImageNet-normalized | see below |
 
 ```json
@@ -501,6 +569,12 @@ ctest --test-dir build --output-on-failure      # or ./build/unit_tests
 - **Block pool:** distinct aligned blocks, exhaustion, no overlap, LIFO
   reuse, RAII and move semantics, a custom (pinned-style) allocator, and an
   8-thread contention stress test.
+- **Histograms:** exact small buckets, bucket bounds and width over random
+  magnitudes, percentile accuracy against exact values, window subtraction,
+  and concurrent recording.
+- **HTTP API end to end** (real sockets, fake model): top-k JSON, 400, 503 on
+  pool exhaustion, `/stats` counts and window exclusion of old traffic, and
+  `/metrics` format validation (every sample line parses).
 - **Dynamic batcher**, with a fake backend that records batch sizes: a lone
   request waits about `max_delay`; a full batch runs without waiting; each of 40
   callers gets its own result; padding rows are ignored; 503 when the queue is
@@ -527,14 +601,18 @@ ctest --test-dir build --output-on-failure      # or ./build/unit_tests
 ├── include/infer/
 │   ├── batching/              dynamic_batcher.hpp
 │   ├── memory/                block_pool.hpp (lock-free fixed-size blocks)
+│   ├── metrics/               histogram.hpp (lock-free log-linear histogram, counters)
 │   ├── net/                   http.hpp (parser, types), http_server.hpp
-│   └── runtime/               model_backend.hpp, onnx_backend.hpp
+│   ├── runtime/               model_backend.hpp, onnx_backend.hpp
+│   └── server/                inference_service.hpp (HTTP API, /stats, /metrics)
 ├── src/
 │   ├── batching/              dynamic_batcher.cpp
 │   ├── memory/                block_pool.cpp
+│   ├── metrics/               histogram.cpp
 │   ├── net/                   http.cpp, http_server.cpp (reactors)
-│   └── runtime/               onnx_backend.cpp (incl. batch-size buckets)
-├── tests/                     GoogleTest: block pool, batcher, parser, server integration
+│   ├── runtime/               onnx_backend.cpp (incl. batch-size buckets)
+│   └── server/                inference_service.cpp
+├── tests/                     GoogleTest: pool, batcher, histogram, parser, server, API
 ├── models/                    export_resnet.py (PyTorch → ONNX + reference data)
 ├── scripts/                   environment setup, CUDA env, infer_client.py
 └── third_party/               ONNX Runtime (downloaded, git-ignored)
@@ -549,6 +627,6 @@ ctest --test-dir build --output-on-failure      # or ./build/unit_tests
 - [x] Phase 2: epoll HTTP server, unbatched baseline
 - [x] Phase 3: request queue + dynamic batcher + worker completion path
 - [x] Phase 4: memory pools (no per-request tensor allocation) + pinned memory
-- [ ] Phase 5: `/metrics` (Prometheus) and `/stats` (JSON)
+- [x] Phase 5: `/metrics` (Prometheus) and `/stats` (JSON)
 - [ ] Phase 6: load generator and benchmarks (batching on vs off)
 - [ ] Phase 7: Docker, CI, graceful shutdown

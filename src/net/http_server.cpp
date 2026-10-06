@@ -189,6 +189,8 @@ private:
                 continue;
             }
             conns_.emplace(conn->id, std::move(conn));
+            active_.fetch_add(1, std::memory_order_relaxed);
+            accepted_.fetch_add(1, std::memory_order_relaxed);
         }
     }
 
@@ -333,7 +335,14 @@ private:
     void close_conn(Connection& c) {
         ::close(c.fd);  // also removes it from the epoll set
         conns_.erase(c.id);
+        active_.fetch_sub(1, std::memory_order_relaxed);
     }
+
+public:
+    std::size_t active_connections() const { return active_.load(std::memory_order_relaxed); }
+    std::uint64_t accepted_connections() const { return accepted_.load(std::memory_order_relaxed); }
+
+private:
 
     const HttpServer& server_;
     int listen_fd_;
@@ -342,6 +351,8 @@ private:
     HttpParser::Limits limits_;
     std::atomic<bool> stopping_{false};
     std::atomic<std::thread::id> loop_thread_{};
+    std::atomic<std::size_t> active_{0};      // read by metrics from other threads
+    std::atomic<std::uint64_t> accepted_{0};
 
     std::unordered_map<std::uint64_t, std::unique_ptr<Connection>> conns_;
     std::uint64_t next_id_ = kFirstConnId;
@@ -393,6 +404,18 @@ void HttpServer::stop() {
     }
     threads_.clear();
     reactors_.clear();
+}
+
+std::size_t HttpServer::active_connections() const {
+    std::size_t n = 0;
+    for (const auto& r : reactors_) n += r->active_connections();
+    return n;
+}
+
+std::uint64_t HttpServer::accepted_connections() const {
+    std::uint64_t n = 0;
+    for (const auto& r : reactors_) n += r->accepted_connections();
+    return n;
 }
 
 void HttpServer::dispatch(HttpRequest&& req, Responder responder) const {

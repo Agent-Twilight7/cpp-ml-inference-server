@@ -58,9 +58,11 @@ find_package(Threads REQUIRED)
 add_library(infer_core STATIC
     src/batching/dynamic_batcher.cpp
     src/memory/block_pool.cpp
+    src/metrics/histogram.cpp
     src/net/http.cpp
     src/net/http_server.cpp
     src/runtime/onnx_backend.cpp
+    src/server/inference_service.cpp
 )
 target_include_directories(infer_core PUBLIC include)
 target_link_libraries(infer_core PUBLIC onnxruntime Threads::Threads)
@@ -90,6 +92,8 @@ if(INFER_BUILD_TESTS)
         tests/dynamic_batcher_test.cpp
         tests/http_parser_test.cpp
         tests/http_server_test.cpp
+        tests/histogram_test.cpp
+        tests/inference_service_test.cpp
     )
     target_link_libraries(unit_tests PRIVATE infer_core GTest::gtest_main)
     include(GoogleTest)

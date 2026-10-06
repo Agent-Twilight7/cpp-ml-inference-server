@@ -1,6 +1,7 @@
 #pragma once
 
 #include "infer/memory/block_pool.hpp"
+#include "infer/metrics/histogram.hpp"
 #include "infer/runtime/model_backend.hpp"
 
 #include <chrono>
@@ -35,6 +36,19 @@ using InferCallback = std::function<void(const InferResult&)>;
 
 using BackendFactory = std::function<std::unique_ptr<ModelBackend>()>;
 
+// What the batcher records when given somewhere to record it.
+struct BatcherMetrics {
+    explicit BatcherMetrics(std::size_t max_batch) : batch_size(max_batch) {}
+
+    metrics::LatencyHistogram queue_wait_us;     // per request: submit -> batch formed
+    metrics::LatencyHistogram batch_compute_us;  // per batch: backend run()
+    metrics::SmallHistogram batch_size;          // per batch: real requests in it
+    metrics::Counter batches;
+    metrics::Counter padded_slots;  // rows run only to fill a batch-size bucket
+    metrics::Counter timeouts;
+    metrics::Counter errors;
+};
+
 struct BatcherOptions {
     std::size_t max_batch_size = 16;
     // A batch runs when it is full, or when its oldest request has waited this long.
@@ -45,6 +59,8 @@ struct BatcherOptions {
     // Zero disables the check.
     std::chrono::microseconds queue_timeout{0};
     int num_workers = 1;
+    // Optional; must outlive the batcher.
+    BatcherMetrics* metrics = nullptr;
 };
 
 // Groups single-sample requests from many threads into batches and runs them

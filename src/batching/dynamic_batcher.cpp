@@ -158,8 +158,9 @@ void DynamicBatcher::run_batch(Worker& w, Clock::time_point formed) {
             return formed - r.enqueued <= opts_.queue_timeout;
         });
         for (auto it = expired; it != w.batch.end(); ++it) {
+            if (opts_.metrics) opts_.metrics->timeouts.inc();
             invoke_callback(it->done, InferResult{.status = InferStatus::kTimeout,
-                                         .queue_time = micros_between(it->enqueued, formed)});
+                                                  .queue_time = micros_between(it->enqueued, formed)});
         }
         w.batch.erase(expired, w.batch.end());
         if (w.batch.empty()) return;
@@ -168,6 +169,7 @@ void DynamicBatcher::run_batch(Worker& w, Clock::time_point formed) {
     // Gather into the batch buffer, returning each request's block to the pool
     // right away so it can take a new request while this batch computes.
     const std::size_t n = w.batch.size();
+    const std::size_t padded = w.backend->padded_batch_size(n);
     for (std::size_t i = 0; i < n; ++i) {
         std::memcpy(w.batch_in.get() + i * input_elems_, w.batch[i].input.data(), input_elems_ * sizeof(float));
         w.batch[i].input.reset();
@@ -177,15 +179,25 @@ void DynamicBatcher::run_batch(Worker& w, Clock::time_point formed) {
     try {
         // Rows n..padded-1 hold stale data from earlier batches; their outputs
         // are ignored, so there's no need to clear them.
-        const std::size_t padded = w.backend->padded_batch_size(n);
         w.backend->run(w.inputs(padded, input_elems_), w.outputs(padded, output_elems_), padded);
     } catch (const std::exception& e) {
+        if (opts_.metrics) opts_.metrics->errors.inc(n);
         for (auto& r : w.batch) {
             invoke_callback(r.done, InferResult{.status = InferStatus::kError, .batch_size = n, .error = e.what()});
         }
         return;
     }
     const auto compute = micros_between(t0, Clock::now());
+
+    if (BatcherMetrics* m = opts_.metrics) {
+        m->batches.inc();
+        m->batch_size.record(n);
+        m->padded_slots.inc(padded - n);
+        m->batch_compute_us.record(static_cast<std::uint64_t>(compute.count()));
+        for (const Request& r : w.batch) {
+            m->queue_wait_us.record(static_cast<std::uint64_t>(micros_between(r.enqueued, formed).count()));
+        }
+    }
 
     for (std::size_t i = 0; i < n; ++i) {
         const Request& r = w.batch[i];

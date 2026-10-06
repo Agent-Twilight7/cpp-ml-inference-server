@@ -1,36 +1,29 @@
-// Inference server entry point.
+// Inference server entry point: parses flags and wires the pieces together.
 //
-// Request path: a reactor thread parses the HTTP request and submits the
-// sample to the DynamicBatcher; a worker thread runs it as part of a batch
-// and the callback hands the response back to the reactor.
+//   HttpServer (epoll reactors) -> InferenceService -> DynamicBatcher -> OnnxBackend
 //
 // Usage:
 //   inference_server --model models/resnet18.onnx [--device cpu|cuda]
 //                    [--port 8080] [--reactors 2] [--workers 2] [--ort-threads 1]
 //                    [--max-batch 16] [--max-delay-us 2000]
-//                    [--queue-size 1024] [--queue-timeout-ms 0] [--buckets auto]
+//                    [--queue-size 1024] [--queue-timeout-ms 0]
+//                    [--buckets auto] [--pinned 1]
 //
 // --max-batch 1 turns batching off (same pipeline, one request per run).
-//
-// API:
-//   GET  /health     -> "ok"
-//   POST /v1/infer   body: one sample as raw little-endian float32
-//                    (3x224x224 for ResNet-18) -> JSON top-5 classes
+// Endpoints: /health, /v1/infer, /stats, /metrics (see InferenceService).
 
 #include "infer/batching/dynamic_batcher.hpp"
 #include "infer/memory/block_pool.hpp"
 #include "infer/net/http_server.hpp"
 #include "infer/runtime/onnx_backend.hpp"
+#include "infer/server/inference_service.hpp"
 
 #include <algorithm>
-#include <cmath>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <exception>
 #include <memory>
-#include <numeric>
 #include <optional>
 #include <string>
 #include <vector>
@@ -51,34 +44,6 @@ struct Config {
     std::string buckets = "auto";  // "auto", "none", or e.g. "1,2,4,8,16"
     bool pinned = true;            // CUDA pinned batch buffers
 };
-
-// Resolves --buckets. "auto" means power-of-two buckets on CUDA (where shape
-// changes are expensive) and none on CPU (where padding costs real compute).
-std::vector<std::size_t> resolve_buckets(const Config& cfg) {
-    if (cfg.buckets == "none") return {};
-    if (cfg.buckets == "auto") {
-        return cfg.device == infer::Device::kCuda ? infer::power_of_two_buckets(cfg.max_batch)
-                                                  : std::vector<std::size_t>{};
-    }
-    std::vector<std::size_t> out;
-    std::size_t pos = 0;
-    while (pos < cfg.buckets.size()) {
-        const std::size_t comma = cfg.buckets.find(',', pos);
-        out.push_back(std::stoul(cfg.buckets.substr(pos, comma - pos)));
-        if (comma == std::string::npos) break;
-        pos = comma + 1;
-    }
-    if (out.empty() || *std::max_element(out.begin(), out.end()) < cfg.max_batch) {
-        throw std::invalid_argument("--buckets must include a size >= --max-batch");
-    }
-    return out;
-}
-
-std::string join(const std::vector<std::size_t>& v) {
-    std::string s;
-    for (std::size_t x : v) s += (s.empty() ? "" : ",") + std::to_string(x);
-    return s.empty() ? "none" : s;
-}
 
 [[noreturn]] void usage(const char* argv0) {
     std::fprintf(stderr,
@@ -127,35 +92,35 @@ Config parse_args(int argc, char** argv) {
     return cfg;
 }
 
-// Formats softmax top-k of one logits row, plus batching info, as JSON.
-std::string result_json(std::span<const float> logits, std::size_t k, const infer::InferResult& res) {
-    const std::size_t n = logits.size();
-    std::vector<std::size_t> idx(n);
-    std::iota(idx.begin(), idx.end(), 0);
-    k = std::min(k, n);
-    std::partial_sort(idx.begin(), idx.begin() + static_cast<std::ptrdiff_t>(k), idx.end(),
-                      [&](std::size_t a, std::size_t b) { return logits[a] > logits[b]; });
-
-    const float max_logit = logits[idx[0]];
-    double denom = 0.0;
-    for (float v : logits) denom += std::exp(static_cast<double>(v - max_logit));
-
-    std::string out = "{\"top_k\":[";
-    char buf[128];
-    for (std::size_t j = 0; j < k; ++j) {
-        const double p = std::exp(static_cast<double>(logits[idx[j]] - max_logit)) / denom;
-        std::snprintf(buf, sizeof(buf), "%s{\"class\":%zu,\"prob\":%.6f}", j ? "," : "", idx[j], p);
-        out += buf;
+// Resolves --buckets. "auto" means power-of-two buckets on CUDA (where shape
+// changes are expensive) and none on CPU (where padding costs real compute).
+std::vector<std::size_t> resolve_buckets(const Config& cfg) {
+    if (cfg.buckets == "none") return {};
+    if (cfg.buckets == "auto") {
+        return cfg.device == infer::Device::kCuda ? infer::power_of_two_buckets(cfg.max_batch)
+                                                  : std::vector<std::size_t>{};
     }
-    std::snprintf(buf, sizeof(buf), "],\"batch_size\":%zu,\"queue_us\":%lld,\"compute_us\":%lld}\n", res.batch_size,
-                  static_cast<long long>(res.queue_time.count()), static_cast<long long>(res.compute_time.count()));
-    out += buf;
+    std::vector<std::size_t> out;
+    std::size_t pos = 0;
+    while (pos < cfg.buckets.size()) {
+        const std::size_t comma = cfg.buckets.find(',', pos);
+        out.push_back(std::stoul(cfg.buckets.substr(pos, comma - pos)));
+        if (comma == std::string::npos) break;
+        pos = comma + 1;
+    }
+    if (out.empty() || *std::max_element(out.begin(), out.end()) < cfg.max_batch) {
+        throw std::invalid_argument("--buckets must include a size >= --max-batch");
+    }
     return out;
 }
 
-}  // namespace
+std::string join(const std::vector<std::size_t>& v) {
+    std::string s;
+    for (std::size_t x : v) s += (s.empty() ? "" : ",") + std::to_string(x);
+    return s.empty() ? "none" : s;
+}
 
-int main(int argc, char** argv) {
+void install_terminate_handler() {
     // If anything ever escapes a thread, say what it was before aborting.
     std::set_terminate([] {
         if (auto e = std::current_exception()) {
@@ -171,7 +136,12 @@ int main(int argc, char** argv) {
         }
         std::abort();
     });
+}
 
+}  // namespace
+
+int main(int argc, char** argv) {
+    install_terminate_handler();
     const Config cfg = parse_args(argc, argv);
 
     // Block termination signals in every thread (threads inherit the mask);
@@ -191,9 +161,12 @@ int main(int argc, char** argv) {
                                                      .intra_op_threads = cfg.ort_threads,
                                                      .batch_buckets = buckets,
                                                      .pinned_host_memory = cfg.pinned};
-        // Declared before the batcher so it outlives it: queued requests hold
-        // its blocks. Created once the batcher knows the input size.
-        std::optional<infer::BlockPool> request_pool;
+
+        // Declaration order is destruction order in reverse: metrics and the
+        // request pool must outlive the batcher, whose queued requests hold
+        // pool blocks and whose workers record metrics.
+        infer::BatcherMetrics batcher_metrics(cfg.max_batch);
+        std::optional<infer::BlockPool> request_pool;  // sized once the input shape is known
         infer::DynamicBatcher batcher(
             infer::BatcherOptions{
                 .max_batch_size = cfg.max_batch,
@@ -201,56 +174,21 @@ int main(int argc, char** argv) {
                 .max_queue_size = cfg.queue_size,
                 .queue_timeout = std::chrono::milliseconds(cfg.queue_timeout_ms),
                 .num_workers = cfg.workers,
+                .metrics = &batcher_metrics,
             },
             [&] { return std::make_unique<infer::OnnxBackend>(backend_opts); });
         batcher.start();  // includes warm-up
-        const std::size_t in_n = batcher.input_elems();
 
-        // Request input buffers: enough for a full queue plus the batches being
-        // gathered. An empty pool means overload (503), so this also caps the
-        // memory requests can pin down. Untouched blocks cost no physical memory.
-        request_pool.emplace(in_n, cfg.queue_size + static_cast<std::size_t>(cfg.workers) * cfg.max_batch);
+        // Enough blocks for a full queue plus the batches being gathered. An
+        // empty pool means overload (503), so this also caps request memory.
+        // Untouched blocks cost no physical memory.
+        request_pool.emplace(batcher.input_elems(),
+                             cfg.queue_size + static_cast<std::size_t>(cfg.workers) * cfg.max_batch);
 
+        infer::InferenceService service(batcher, *request_pool, &batcher_metrics);
         infer::net::HttpServer server({.port = cfg.port, .num_reactors = cfg.reactors});
-
-        server.route("GET", "/health", [](infer::net::HttpRequest&&, infer::net::Responder r) {
-            r.send(infer::net::HttpResponse::text(200, "ok\n"));
-        });
-
-        server.route("POST", "/v1/infer", [&batcher, &request_pool, in_n](infer::net::HttpRequest&& req,
-                                                                          infer::net::Responder r) {
-            const std::size_t want = in_n * sizeof(float);
-            if (req.body.size() != want) {
-                r.send(infer::net::HttpResponse::text(
-                    400, "expected " + std::to_string(want) + " bytes (" + std::to_string(in_n) +
-                             " float32), got " + std::to_string(req.body.size()) + "\n"));
-                return;
-            }
-            // The one copy of the input: from the connection's receive buffer
-            // into a preallocated, aligned pool block. No allocation.
-            infer::BlockPool::Block input = request_pool->try_acquire();
-            if (!input) {
-                r.send(infer::net::HttpResponse::text(503, "server overloaded, retry later\n"));
-                return;
-            }
-            std::memcpy(input.data(), req.body.data(), want);
-
-            const bool accepted = batcher.submit(std::move(input), [r](const infer::InferResult& res) {
-                switch (res.status) {
-                    case infer::InferStatus::kOk:
-                        r.send(infer::net::HttpResponse::json(200, result_json(res.output, 5, res)));
-                        break;
-                    case infer::InferStatus::kTimeout:
-                        r.send(infer::net::HttpResponse::text(504, "timed out in queue\n"));
-                        break;
-                    case infer::InferStatus::kError:
-                        r.send(infer::net::HttpResponse::text(500, "inference failed: " + std::string(res.error) + "\n"));
-                        break;
-                }
-            });
-            if (!accepted) r.send(infer::net::HttpResponse::text(503, "server overloaded, retry later\n"));
-        });
-
+        service.install(server);
+        service.start();
         server.start();
         std::fprintf(stderr, "listening on :%u | reactors=%d workers=%d max_batch=%zu max_delay=%ldus queue=%zu\n",
                      server.port(), cfg.reactors, cfg.workers, cfg.max_batch, cfg.max_delay_us, cfg.queue_size);
@@ -262,6 +200,7 @@ int main(int argc, char** argv) {
         // still be alive. New requests arriving meanwhile get 503.
         batcher.stop();
         server.stop();
+        service.stop();
     } catch (const std::exception& e) {
         std::fprintf(stderr, "fatal: %s\n", e.what());
         return 1;

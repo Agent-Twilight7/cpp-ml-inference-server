@@ -66,6 +66,10 @@ public:
     // The bound port (resolves port 0 after start()).
     std::uint16_t port() const { return bound_port_; }
 
+    // Thread-safe; for metrics.
+    std::size_t active_connections() const;
+    std::uint64_t accepted_connections() const;
+
 private:
     friend class Reactor;
     void dispatch(HttpRequest&& req, Responder responder) const;
