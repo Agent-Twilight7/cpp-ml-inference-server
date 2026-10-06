@@ -8,3 +8,4 @@ models/*.bin
 compile_commands.json
 .cache/
 .vscode/
+bench/results/server.log

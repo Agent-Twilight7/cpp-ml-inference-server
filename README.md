@@ -5,11 +5,10 @@ stack**, **dynamic batching** (the technique behind NVIDIA Triton and vLLM),
 preallocated memory pools, ONNX Runtime execution on CPU or **CUDA GPU**, and a
 metrics endpoint with p50/p99 latency, throughput, queue depth and batch sizes.
 
-> **Status: Phase 5 done.** Dynamic batching plus pinned, pooled memory serves
-> **1,912 req/s on one laptop GPU (2.9× unbatched), with p99 latency down from
-> 126 ms to 42 ms**, and the server reports its own p50/p99, throughput, queue
-> depth and batch sizes at `/stats` and `/metrics`. Next: C++ load generator and
-> benchmarks. See [Roadmap](#roadmap).
+> **Status: Phase 6 done.** On one laptop GPU, dynamic batching sustains
+> **3× the load of unbatched serving at the same 30 ms p99** (1,500 vs 500
+> req/s), and peaks at ~1,800 req/s (2.7×). Next: graceful shutdown, Docker,
+> CI. See [Roadmap](#roadmap).
 
 ---
 
@@ -26,6 +25,7 @@ metrics endpoint with p50/p99 latency, throughput, queue depth and batch sizes.
   - [Model runtime](#model-runtime-srcruntime)
 - [API](#api)
 - [Build and run](#build-and-run)
+- [Benchmarking](#benchmarking)
 - [Testing](#testing)
 - [Project layout](#project-layout)
 - [Roadmap](#roadmap)
@@ -34,28 +34,74 @@ metrics endpoint with p50/p99 latency, throughput, queue depth and batch sizes.
 
 ## Results
 
-ResNet-18 on an RTX 4060 Laptop GPU, closed-loop keep-alive clients sending
-one image per request for 6 s (`scripts/infer_client.py`, 8 client processes).
-"Off" is the same server with `--max-batch 1 --workers 4`; "on" uses
-`--max-batch 16 --max-delay-us 2000 --workers 2`.
+All numbers: ResNet-18 (224×224, FP32) on one **RTX 4060 Laptop GPU**, server
+and load generator on the same machine (WSL2, 24 logical cores). Every request
+carries one 602 KB image. Measured with the bundled C++ load generator
+(`loadgen`) via `bench/run_benchmarks.py`; raw data is in `bench/results/`.
+"No batching" is the same server with `--max-batch 1 --workers 4`. "Dynamic
+batching" is `--max-batch 16 --max-delay-us 2000 --workers 2`.
 
-| Clients | Batching | Throughput | p50 | p90 | p99 | Avg batch |
-|---:|---|---:|---:|---:|---:|---:|
-| 16 | off | 652 req/s | 25.7 ms | 30.9 ms | 37.0 ms | 1.0 |
-| 16 | **on** | **1,184 req/s** | **14.4 ms** | **16.3 ms** | **19.3 ms** | 10.2 |
-| 64 | off | 665 req/s | 103.3 ms | 110.8 ms | 126.0 ms | 1.0 |
-| 64 | on | 1,537 req/s | 44.5 ms | 46.5 ms | 49.2 ms | 16.0 |
-| 64 | **on + pinned memory** (Phase 4) | **1,912 req/s** | **35.3 ms** | **37.9 ms** | **41.7 ms** | 16.0 |
+![Throughput and p99 latency vs concurrency](docs/images/concurrency.png)
 
-Batching lowers latency as well as raising throughput: unbatched requests
-queue behind each other one image at a time, while a batch of 16 takes about
-9 ms on the GPU. Pinned batch buffers then add another 23% at full load by
-making host→GPU copies direct DMA. (A dedicated C++ load generator comes in
-Phase 6.)
+**Closed loop** (each connection sends its next request when the last one
+returns):
 
-A larger `--max-batch 32` was *slower* at 64 clients (1,240 req/s): batches
-averaged 23 requests and got padded to 32, and bigger batches mean longer
-waits. Max batch size is a tuning knob, not "bigger is better".
+| Connections | No batching | Dynamic batching | p99, no batching | p99, batching |
+|---:|---:|---:|---:|---:|
+| 1 | 423 req/s | 189 req/s | 4.6 ms | 8.5 ms |
+| 8 | 670 req/s | 979 req/s | 21.3 ms | 9.2 ms |
+| 16 | 660 req/s | 1,267 req/s | 37.8 ms | 13.8 ms |
+| 64 | 668 req/s | **1,795 req/s (2.7×)** | 120.5 ms | **36.8 ms** |
+| 256 | 673 req/s | 1,789 req/s | 408.8 ms | 147.4 ms |
+
+Unbatched throughput flattens at ~670 req/s from 4 connections on; after that,
+extra clients only add queueing delay. Batching keeps scaling to ~1,800 req/s.
+At **a single connection batching is slower** (189 vs 423 req/s): a lone
+request waits out the 2 ms delay hoping for company that never comes. Batching
+trades a small latency cost at idle for capacity under load.
+
+![Latency vs offered load](docs/images/latency_vs_load.png)
+
+**Open loop** (Poisson arrivals at a fixed rate; latency measured from each
+request's *scheduled* send time, so stalls aren't hidden):
+
+| Offered load | No batching p50 / p99 | Dynamic batching p50 / p99 | Avg batch |
+|---:|---:|---:|---:|
+| 500 req/s | 5.4 / 26.3 ms | 5.3 / 9.5 ms | 2.6 |
+| 600 req/s | 9.7 / 60.2 ms | — | — |
+| 700 req/s | **243.7 / 370.0 ms** (saturated) | — | — |
+| 1,000 req/s | — | 7.2 / 14.7 ms | 4.2 |
+| 1,500 req/s | — | **21.3 / 29.9 ms** | 12.8 |
+| 1,750 req/s | — | 284.1 / 432.6 ms (saturated) | 16.0 |
+
+**With a p99 target of 30 ms, batching sustains 1,500 req/s against ~500 req/s
+unbatched: 3× the capacity at the same tail latency.** Batch size adapts by
+itself: ~2.6 requests per batch at 500 req/s, ~13 at 1,500 req/s.
+
+At very low load (100 req/s) both configurations show ~30 ms p99. Requests that
+sparse let the laptop GPU drop to low clocks between them. This is a power
+management effect, not queueing.
+
+![Effect of max_delay](docs/images/max_delay.png)
+
+**The `--max-delay` knob** (open loop, 1,000 req/s): with two workers, batches
+already form *while the GPU is busy*, so delays up to 2 ms barely change batch
+size (~4). Beyond that, waiting fills batches (10 at 8 ms) but raises median
+latency. The default of 2 ms had the lowest p99 (15.2 ms).
+
+**CPU** (4 workers × 4 threads, 32 connections): 126 req/s without batching,
+133 with. As predicted by [the per-batch timings](#why-batching), batching
+buys almost nothing on CPU, where convolutions are compute-bound at any batch
+size.
+
+**Optimization history**, GPU at 64 concurrent clients (early phases used a
+Python client, so treat cross-phase numbers as indicative):
+
+| Step | Throughput | p99 |
+|---|---:|---:|
+| Unbatched baseline (Phase 2/3) | 665 req/s | 126 ms |
+| + dynamic batching (Phase 3) | 297 → 1,537 req/s after fixing [shape-change thrash](#model-runtime-srcruntime) | 49 ms |
+| + pinned, pooled memory (Phase 4) | 1,912 req/s | 42 ms |
 
 ---
 
@@ -554,6 +600,38 @@ cmake --build build-cuda
 
 ---
 
+## Benchmarking
+
+`loadgen` is a C++ load generator built alongside the server. It reuses the
+server's lock-free histogram.
+
+```bash
+# Closed loop: 64 connections, each sends its next request when the last returns
+./build/loadgen --port 8080 --mode closed --connections 64 --duration 10 --input models/ref_input.bin
+# Open loop: Poisson arrivals at 1,500 req/s spread over 256 connections
+./build/loadgen --port 8080 --mode open --rate 1500 --connections 256 --duration 10
+# --json prints one machine-readable line
+```
+
+**Why open loop matters.** A closed-loop tool only sends a new request after
+the previous one returns. If the server stalls for 100 ms, the tool stops
+sending for 100 ms too, and those would-be requests never get measured. This is
+*coordinated omission*, and it makes tails look far better than users
+experience. In open-loop mode, `loadgen` schedules arrivals in advance (Poisson
+process) and measures each request from its *scheduled* time, so a stall
+counts against every request it delayed. It also reports "late starts" when
+all connections were busy at a scheduled time.
+
+The full suite (concurrency sweep, offered-load sweep, delay sweep, CPU
+comparison) and the charts:
+
+```bash
+python bench/run_benchmarks.py --build ~/builds/infer-cuda   # ~10 min, writes bench/results/*.json
+python bench/plot_results.py                                 # writes docs/images/*.png
+```
+
+---
+
 ## Testing
 
 ```bash
@@ -597,6 +675,7 @@ ctest --test-dir build --output-on-failure      # or ./build/unit_tests
 ```
 ├── apps/
 │   ├── server_main.cpp        inference server executable
+│   ├── loadgen.cpp            C++ load generator (closed / open loop)
 │   └── ort_smoke.cpp          C++ vs PyTorch check + batch-size timing
 ├── include/infer/
 │   ├── batching/              dynamic_batcher.hpp
@@ -613,6 +692,8 @@ ctest --test-dir build --output-on-failure      # or ./build/unit_tests
 │   ├── runtime/               onnx_backend.cpp (incl. batch-size buckets)
 │   └── server/                inference_service.cpp
 ├── tests/                     GoogleTest: pool, batcher, histogram, parser, server, API
+├── bench/                     run_benchmarks.py, plot_results.py, results/*.json
+├── docs/images/               benchmark charts
 ├── models/                    export_resnet.py (PyTorch → ONNX + reference data)
 ├── scripts/                   environment setup, CUDA env, infer_client.py
 └── third_party/               ONNX Runtime (downloaded, git-ignored)
@@ -628,5 +709,5 @@ ctest --test-dir build --output-on-failure      # or ./build/unit_tests
 - [x] Phase 3: request queue + dynamic batcher + worker completion path
 - [x] Phase 4: memory pools (no per-request tensor allocation) + pinned memory
 - [x] Phase 5: `/metrics` (Prometheus) and `/stats` (JSON)
-- [ ] Phase 6: load generator and benchmarks (batching on vs off)
+- [x] Phase 6: C++ load generator (closed + open loop) and benchmark suite with charts
 - [ ] Phase 7: Docker, CI, graceful shutdown

@@ -1,0 +1,46 @@
+[
+ {
+  "mode": "closed",
+  "connections": 32,
+  "target_rps": 0.0,
+  "duration_s": 8.0,
+  "requests": 1011,
+  "ok": 1011,
+  "errors": 0,
+  "throughput_rps": 126.4,
+  "mean_ms": 253.27,
+  "p50_ms": 250.632,
+  "p90_ms": 281.786,
+  "p99_ms": 307.844,
+  "p999_ms": 323.539,
+  "max_ms": 327.68,
+  "avg_batch": 1.0,
+  "late_starts": 0,
+  "status": {
+   "200": 1011
+  },
+  "batching": "off"
+ },
+ {
+  "mode": "closed",
+  "connections": 32,
+  "target_rps": 0.0,
+  "duration_s": 8.0,
+  "requests": 1063,
+  "ok": 1063,
+  "errors": 0,
+  "throughput_rps": 132.9,
+  "mean_ms": 240.781,
+  "p50_ms": 236.715,
+  "p90_ms": 313.985,
+  "p99_ms": 387.269,
+  "p999_ms": 456.264,
+  "max_ms": 458.752,
+  "avg_batch": 6.46,
+  "late_starts": 0,
+  "status": {
+   "200": 1063
+  },
+  "batching": "on"
+ }
+]

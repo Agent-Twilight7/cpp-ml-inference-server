@@ -77,6 +77,9 @@ target_link_libraries(ort_smoke PRIVATE infer_core)
 add_executable(inference_server apps/server_main.cpp)
 target_link_libraries(inference_server PRIVATE infer_core)
 
+add_executable(loadgen apps/loadgen.cpp)
+target_link_libraries(loadgen PRIVATE infer_core)
+
 # ---- Tests ----
 option(INFER_BUILD_TESTS "Build unit tests (fetches GoogleTest)" ON)
 if(INFER_BUILD_TESTS)
