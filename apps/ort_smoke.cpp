@@ -87,6 +87,28 @@ int run_smoke(int argc, char** argv) {
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / kIters;
         std::printf("%8zu %12.2f %14.2f %16.1f\n", b, ms, ms / static_cast<double>(b), 1000.0 * static_cast<double>(b) / ms);
     }
+
+    // ---- Cost of changing shape between runs ----
+    // A server sees a different batch size almost every run; time that pattern
+    // against repeating one size.
+    {
+        std::vector<float> in(8 * in_n, 0.5f);
+        std::vector<float> o(8 * out_n);
+        auto time_pattern = [&](std::initializer_list<std::size_t> sizes) {
+            constexpr int kRounds = 10;
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < kRounds; ++i) {
+                for (std::size_t b : sizes) backend.run(in, o, b);
+            }
+            return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() /
+                   (kRounds * static_cast<double>(sizes.size()));
+        };
+        const double same = time_pattern({4, 4});
+        const double alternating = time_pattern({4, 8});
+        const double same8 = time_pattern({8, 8});
+        std::printf("\nshape changes: 4,4,4..: %.2f ms/run | 8,8,8..: %.2f ms/run | 4,8,4,8..: %.2f ms/run\n", same,
+                    same8, alternating);
+    }
     return ok ? 0 : 1;
 }
 

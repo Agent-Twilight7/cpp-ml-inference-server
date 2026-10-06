@@ -1,14 +1,17 @@
 #include "infer/runtime/onnx_backend.hpp"
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace infer {
 namespace {
 
-// ORT allows exactly one Env per process; every session shares it.
+// ORT allows exactly one Env per process; every session shares it. It is
+// deliberately never destroyed: tearing it down during static destruction can
+// run after the CUDA runtime has already unloaded and abort the process at exit.
 Ort::Env& ort_env() {
-    static Ort::Env env{ORT_LOGGING_LEVEL_WARNING, "infer"};
-    return env;
+    static Ort::Env* env = new Ort::Env{ORT_LOGGING_LEVEL_WARNING, "infer"};
+    return *env;
 }
 
 // Splits a model shape into (batch dim, per-sample dims) and validates it.
@@ -64,21 +67,30 @@ OnnxBackend::OnnxBackend(const OnnxBackendOptions& opts) {
 #endif
     }
 
-    session_ = Ort::Session(env, opts.model_path.c_str(), so);
+    buckets_ = opts.batch_buckets;
+    std::sort(buckets_.begin(), buckets_.end());
+    buckets_.erase(std::unique(buckets_.begin(), buckets_.end()), buckets_.end());
+    if (!buckets_.empty() && buckets_.front() == 0) throw std::invalid_argument("batch bucket sizes must be >= 1");
+
+    const std::size_t num_sessions = buckets_.empty() ? 1 : buckets_.size();
+    for (std::size_t i = 0; i < num_sessions; ++i) {
+        sessions_.emplace_back(env, opts.model_path.c_str(), so);
+    }
     mem_info_ = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
 
-    if (session_.GetInputCount() != 1 || session_.GetOutputCount() != 1) {
+    Ort::Session& meta = sessions_.front();
+    if (meta.GetInputCount() != 1 || meta.GetOutputCount() != 1) {
         throw std::runtime_error("model must have exactly one input and one output");
     }
 
     Ort::AllocatorWithDefaultOptions alloc;
-    input_name_ = session_.GetInputNameAllocated(0, alloc).get();
-    output_name_ = session_.GetOutputNameAllocated(0, alloc).get();
+    input_name_ = meta.GetInputNameAllocated(0, alloc).get();
+    output_name_ = meta.GetOutputNameAllocated(0, alloc).get();
 
     // The shape infos are non-owning views into the TypeInfo objects, so those
     // must stay alive while we read them.
-    Ort::TypeInfo in_type = session_.GetInputTypeInfo(0);
-    Ort::TypeInfo out_type = session_.GetOutputTypeInfo(0);
+    Ort::TypeInfo in_type = meta.GetInputTypeInfo(0);
+    Ort::TypeInfo out_type = meta.GetOutputTypeInfo(0);
     auto in_info = in_type.GetTensorTypeAndShapeInfo();
     auto out_info = out_type.GetTensorTypeAndShapeInfo();
     if (in_info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
@@ -92,8 +104,32 @@ OnnxBackend::OnnxBackend(const OnnxBackendOptions& opts) {
     output_elems_ = elem_count(output_shape_);
 }
 
+std::size_t OnnxBackend::padded_batch_size(std::size_t n) const {
+    if (buckets_.empty()) return n;
+    auto it = std::lower_bound(buckets_.begin(), buckets_.end(), n);
+    if (it == buckets_.end()) throw std::invalid_argument("batch larger than the biggest bucket");
+    return *it;
+}
+
+Ort::Session& OnnxBackend::session_for(std::size_t batch) {
+    if (buckets_.empty()) return sessions_.front();
+    auto it = std::lower_bound(buckets_.begin(), buckets_.end(), batch);
+    if (it == buckets_.end() || *it != batch) {
+        throw std::invalid_argument("batch size " + std::to_string(batch) + " is not a bucket; use padded_batch_size()");
+    }
+    return sessions_[static_cast<std::size_t>(it - buckets_.begin())];
+}
+
+std::vector<std::size_t> power_of_two_buckets(std::size_t max_batch) {
+    std::vector<std::size_t> out;
+    for (std::size_t b = 1; b < max_batch; b *= 2) out.push_back(b);
+    out.push_back(max_batch);
+    return out;
+}
+
 void OnnxBackend::run(std::span<const float> input, std::span<float> output, std::size_t batch) {
     if (batch == 0) return;
+    Ort::Session& session = session_for(batch);
     if (input.size() < batch * input_elems_ || output.size() < batch * output_elems_) {
         throw std::invalid_argument("OnnxBackend::run: buffer too small for batch");
     }
@@ -112,7 +148,7 @@ void OnnxBackend::run(std::span<const float> input, std::span<float> output, std
 
     const char* in_names[] = {input_name_.c_str()};
     const char* out_names[] = {output_name_.c_str()};
-    session_.Run(Ort::RunOptions{nullptr}, in_names, &in_tensor, 1, out_names, &out_tensor, 1);
+    session.Run(Ort::RunOptions{nullptr}, in_names, &in_tensor, 1, out_names, &out_tensor, 1);
 }
 
 }  // namespace infer

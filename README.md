@@ -5,23 +5,51 @@ stack**, **dynamic batching** (the technique behind NVIDIA Triton and vLLM),
 preallocated memory pools, ONNX Runtime execution on CPU or **CUDA GPU**, and a
 metrics endpoint with p50/p99 latency, throughput, queue depth and batch sizes.
 
-> **Status: Phase 2 done** — multi-reactor epoll HTTP server serving ResNet-18
-> (unbatched baseline). Next: the dynamic batcher. See [Roadmap](#roadmap).
+> **Status: Phase 3 done.** Dynamic batching on GPU serves **1,537 req/s
+> (2.3× unbatched) with p99 latency down from 126 ms to 49 ms**. Next:
+> memory pools. See [Roadmap](#roadmap).
 
 ---
 
 ## Contents
 
+- [Results](#results)
 - [Why batching?](#why-batching)
 - [Architecture](#architecture)
   - [Target design](#target-design)
   - [Network layer](#network-layer-srcnet)
+  - [Dynamic batcher](#dynamic-batcher-srcbatching)
   - [Model runtime](#model-runtime-srcruntime)
 - [API](#api)
 - [Build and run](#build-and-run)
 - [Testing](#testing)
 - [Project layout](#project-layout)
 - [Roadmap](#roadmap)
+
+---
+
+## Results
+
+ResNet-18 on an RTX 4060 Laptop GPU, closed-loop keep-alive clients sending
+one image per request for 6 s (`scripts/infer_client.py`, 8 client processes).
+"Off" is the same server with `--max-batch 1 --workers 4`; "on" uses
+`--max-batch 16 --max-delay-us 2000 --workers 2`.
+
+| Clients | Batching | Throughput | p50 | p90 | p99 | Avg batch |
+|---:|---|---:|---:|---:|---:|---:|
+| 16 | off | 652 req/s | 25.7 ms | 30.9 ms | 37.0 ms | 1.0 |
+| 16 | **on** | **1,184 req/s** | **14.4 ms** | **16.3 ms** | **19.3 ms** | 10.2 |
+| 64 | off | 665 req/s | 103.3 ms | 110.8 ms | 126.0 ms | 1.0 |
+| 64 | **on** | **1,537 req/s** | **44.5 ms** | **46.5 ms** | **49.2 ms** | 16.0 |
+
+Batching lowers latency as well as raising throughput: unbatched requests
+queue behind each other one image at a time, while a batch of 16 takes about
+9 ms on the GPU. 1,537 req/s is close to the GPU's ceiling of ~1,700
+images/s at batch 16. (A dedicated C++ load generator comes in Phase 6.)
+
+A larger `--max-batch 32` was *slower* at 64 clients (1,240 req/s): batches
+averaged 23 requests and got padded to 32, and bigger batches mean longer
+waits. Max batch size is a tuning knob, not "bigger is better".
 
 ---
 
@@ -83,10 +111,10 @@ flowchart LR
         r2["Reactor thread N<br/>epoll + listener"]
     end
 
-    subgraph core["Batching core (Phase 3–4)"]
-        q[["Bounded request queue"]]
-        b["Dynamic batcher<br/>max_batch / max_delay"]
-        mp[("Memory pool<br/>preallocated tensors")]
+    subgraph core["Batching core ✅"]
+        q[["Bounded request queue ✅"]]
+        b["Dynamic batcher ✅<br/>max_batch / max_delay"]
+        mp[("Memory pool<br/>preallocated tensors (Phase 4)")]
     end
 
     subgraph exec["Executors"]
@@ -105,22 +133,27 @@ flowchart LR
     b -.-> m
 ```
 
-**Today (Phase 2)** the batching core is not there yet: each reactor thread runs
-the model inline on its own session, one request at a time. That is the
-*unbatched baseline* every later phase is measured against.
+**Life of a request:**
 
-**Phase 2 baseline**: 4 reactors and 4 sessions, 16 concurrent keep-alive
-clients for 5 s (`scripts/infer_client.py`):
-
-| Device | Throughput | p50 | p90 | p99 |
-|---|---:|---:|---:|---:|
-| CPU (4 × 1 ORT thread) | 68.7 req/s | 257 ms | 340 ms | 372 ms |
-| GPU, RTX 4060 Laptop | 611 req/s | 27.1 ms | 37.1 ms | 49.2 ms |
-
-The GPU baseline already beats one session's 283 images/s because 4 sessions
-overlap on the GPU. It is still far below the ~1,700 images/s the GPU reaches
-on batches of 16. (These numbers come from a Python client; the C++ load
-generator in Phase 6 will give the definitive comparison.)
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant R as Reactor thread
+    participant Q as Batcher queue
+    participant W as Worker thread
+    participant G as ONNX Runtime (GPU)
+    C->>R: POST /v1/infer (602 KB float32)
+    R->>R: parse HTTP, copy body to aligned floats
+    R->>Q: submit(input, callback), or 503 if queue full
+    Note over R: reactor is free again,<br/>serves other sockets
+    W->>Q: form batch (full, or oldest waited max_delay)
+    W->>W: gather inputs into the preallocated batch buffer
+    W->>G: run(padded batch)
+    G-->>W: logits [B, 1000]
+    W->>W: per request: softmax top-5 → JSON
+    W->>R: Responder::send() via completion queue + eventfd
+    R->>C: HTTP 200 JSON
+```
 
 ### Network layer (`src/net/`)
 
@@ -205,6 +238,63 @@ response is dropped: no use-after-free, and no confusion when the kernel
 reuses the fd number. Only the first completion after a drain writes to the
 eventfd, so a burst of results costs one syscall to wake the loop.
 
+### Dynamic batcher (`src/batching/`)
+
+`DynamicBatcher` turns single-image requests from many reactor threads into
+batches and runs them on K worker threads. Each worker owns one model backend
+and a batch input/output buffer allocated once at startup.
+
+**When does a batch run?** As soon as either:
+
+1. `max_batch_size` requests are waiting (run now, don't wait), or
+2. the *oldest* waiting request has waited `max_queue_delay` (default 2 ms).
+
+The delay is measured from the oldest request's arrival, not from when the
+worker started looking. A request that already waited behind the previous
+batch goes out immediately instead of waiting another 2 ms.
+
+**One leader at a time.** Only one idle worker, the leader, waits on the
+queue. The others wait for leadership. When the leader takes its batch it gives
+up leadership and goes to compute, and the next worker immediately starts
+collecting. So while one batch runs on the GPU, the next is already forming:
+
+```mermaid
+sequenceDiagram
+    participant Q as Queue
+    participant W1 as Worker 1
+    participant W2 as Worker 2
+    participant G as GPU
+    Note over W1: leader
+    Q->>W1: batch A (full or timed out)
+    Note over W2: becomes leader
+    W1->>G: run batch A
+    Q->>W2: batch B collects while A runs
+    G-->>W1: results A → callbacks
+    Note over W1: waits to be leader again
+    W2->>G: run batch B
+```
+
+Because only the leader ever waits on the condition variable, `submit()` can
+use `notify_one()`, and it only notifies on the two transitions the leader
+cares about: queue became non-empty (start the delay clock) and batch is now
+full (run immediately). Other submits make no wake-up call at all.
+
+**Backpressure and failure handling:**
+
+- **Bounded queue:** beyond `--queue-size` waiting requests, `submit()`
+  refuses and the client gets **503**. Overload sheds load instead of growing
+  memory and latency without bound.
+- **Queue timeout:** with `--queue-timeout-ms`, requests that waited too long
+  are failed with **504** before wasting GPU time on them.
+- **Errors:** if the backend throws, every request in that batch gets 500. A
+  throwing callback is caught so it can't kill the worker.
+- **Shutdown:** `stop()` refuses new work, flushes everything queued without
+  waiting out the delay, and joins the workers. The server stops the batcher
+  *before* the HTTP layer, because callbacks deliver through the reactors.
+
+**`--max-batch 1` turns batching off** while keeping exactly the same
+pipeline, which is how the "off" rows in [Results](#results) were measured.
+
 ### Model runtime (`src/runtime/`)
 
 `ModelBackend` is the interface the server sees: run *B* samples from a
@@ -220,6 +310,32 @@ caller-owned input buffer into a caller-owned output buffer.
 - `--device cuda` attaches the CUDA execution provider. The CUDA/cuDNN
   runtime comes from pip wheels, so no system CUDA toolkit is needed.
 
+**Batch-size buckets: the bug that halved GPU throughput.** The first batched
+benchmark was *slower* than unbatched at 16 clients (297 vs 652 req/s). The
+server reports per-request `queue_us` / `compute_us`, and these showed a batch
+of 4 taking **38 ms** in the server against 3.6 ms in `ort_smoke`. The
+difference: `ort_smoke` repeated one batch size, while the server's batch size
+changes almost every run. ONNX Runtime's CUDA convolutions redo per-layer
+setup whenever the input shape differs from the session's previous run.
+`ort_smoke` now measures this:
+
+| Run pattern (GPU) | ms per run |
+|---|---:|
+| 4, 4, 4, … | 4.8 |
+| 8, 8, 8, … | 4.8 |
+| 4, 8, 4, 8, … | **35.2** |
+
+The fix: each worker holds **one session per batch-size bucket** (1, 2, 4, 8,
+16), and batches are padded up to the next bucket. Each session only ever sees
+one shape. This is the same idea as Triton's preferred batch sizes or TensorRT
+optimization profiles. Padding 5 → 8 costs far less on a GPU than a 30 ms
+reshape. After the fix a batch of 4 takes 6 ms in the server and throughput at
+16 clients went from 297 to 1,184 req/s.
+
+On CPU the same experiment shows no penalty (4,8,4,8 averages exactly between
+4,4 and 8,8), and padding costs real compute there. So `--buckets auto` uses
+power-of-two buckets on CUDA and none on CPU.
+
 `models/export_resnet.py` exports torchvision's ResNet-18 with a dynamic batch
 dimension and saves a reference batch. `ort_smoke` checks C++ outputs against
 PyTorch: max difference 5e-6 on CPU, 5e-3 on GPU (TF32 convolutions), with
@@ -232,7 +348,23 @@ identical top-1 classes.
 | Method | Path | Body | Response |
 |---|---|---|---|
 | `GET` | `/health` | — | `ok` |
-| `POST` | `/v1/infer` | one image as raw little-endian float32, shape 3×224×224 (602,112 bytes), ImageNet-normalized | `{"top_k":[{"class":281,"prob":0.41},…]}` (top 5, softmax) |
+| `POST` | `/v1/infer` | one image as raw little-endian float32, shape 3×224×224 (602,112 bytes), ImageNet-normalized | see below |
+
+```json
+{"top_k":[{"class":281,"prob":0.412},{"class":285,"prob":0.187}, ...],
+ "batch_size":12, "queue_us":1830, "compute_us":8204}
+```
+
+`top_k` is the top 5 classes with softmax probabilities. `batch_size` is how
+many requests ran together, `queue_us` is how long this request waited before
+its batch formed, and `compute_us` is the model run time for the whole batch.
+
+| Status | Meaning |
+|---|---|
+| 400 | body is not exactly 602,112 bytes |
+| 503 | request queue full (overload); retry later |
+| 504 | waited longer than `--queue-timeout-ms` |
+| 500 | model execution failed |
 
 ```bash
 python - <<'EOF'
@@ -257,7 +389,7 @@ python models/export_resnet.py     # resnet18.onnx + reference batch
 
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-./build/inference_server --model models/resnet18.onnx --port 8080 --reactors 4
+./build/inference_server --model models/resnet18.onnx --port 8080
 python scripts/infer_client.py --port 8080      # correctness check + quick load test
 ```
 
@@ -283,8 +415,14 @@ cmake --build build-cuda
 | `--model` | `models/resnet18.onnx` | ONNX model path |
 | `--device` | `cpu` | `cpu` or `cuda` |
 | `--port` | `8080` | listen port |
-| `--reactors` | `4` | epoll reactor threads (and, in Phase 2, model sessions) |
+| `--reactors` | `2` | epoll reactor (network) threads |
+| `--workers` | `2` | batch executor threads, each with its own model sessions |
 | `--ort-threads` | `1` | ONNX Runtime intra-op threads per session (CPU) |
+| `--max-batch` | `16` | largest batch; `1` disables batching |
+| `--max-delay-us` | `2000` | longest the oldest request waits for a batch to fill |
+| `--queue-size` | `1024` | waiting requests before new ones get 503 |
+| `--queue-timeout-ms` | `0` (off) | fail requests that waited longer with 504 |
+| `--buckets` | `auto` | batch-size buckets: `auto` (powers of two on CUDA, none on CPU), `none`, or a list like `1,4,16` |
 
 ---
 
@@ -300,8 +438,20 @@ ctest --test-dir build --output-on-failure      # or ./build/unit_tests
   Covers keep-alive, in-order pipelining with an async handler, 1 MiB bodies
   arriving in pieces, 404/405, malformed input (400 and close), clients
   disconnecting mid-request, and 32 concurrent clients.
+- **Dynamic batcher**, with a fake backend that records batch sizes: a lone
+  request waits about `max_delay`; a full batch runs without waiting; each of 40
+  callers gets its own result; padding rows are ignored; 503 when the queue is
+  full; `stop()` drains without waiting; backend failure fails the whole
+  batch; queue timeouts; and 8 producers × 3 workers × 1,600 requests.
 - **Sanitizers:** the same suite under AddressSanitizer + UBSan
   (`-DINFER_ENABLE_ASAN=ON`) and ThreadSanitizer (`-DINFER_ENABLE_TSAN=ON`).
+
+> **ThreadSanitizer notes.** Build TSan with clang
+> (`CC=clang CXX=clang++`). GCC 11's TSan runtime doesn't intercept
+> `pthread_cond_clockwait`, which `condition_variable::wait_until` uses, so it
+> reports false "double lock" errors. On newer kernels, run TSan binaries
+> under `setarch $(uname -m) -R` (disables ASLR) to avoid "unexpected memory
+> mapping" failures.
 
 ---
 
@@ -312,12 +462,14 @@ ctest --test-dir build --output-on-failure      # or ./build/unit_tests
 │   ├── server_main.cpp        inference server executable
 │   └── ort_smoke.cpp          C++ vs PyTorch check + batch-size timing
 ├── include/infer/
+│   ├── batching/              dynamic_batcher.hpp
 │   ├── net/                   http.hpp (parser, types), http_server.hpp
 │   └── runtime/               model_backend.hpp, onnx_backend.hpp
 ├── src/
+│   ├── batching/              dynamic_batcher.cpp
 │   ├── net/                   http.cpp, http_server.cpp (reactors)
-│   └── runtime/               onnx_backend.cpp
-├── tests/                     GoogleTest: parser + server integration
+│   └── runtime/               onnx_backend.cpp (incl. batch-size buckets)
+├── tests/                     GoogleTest: batcher, parser, server integration
 ├── models/                    export_resnet.py (PyTorch → ONNX + reference data)
 ├── scripts/                   environment setup, CUDA env, infer_client.py
 └── third_party/               ONNX Runtime (downloaded, git-ignored)
@@ -330,8 +482,8 @@ ctest --test-dir build --output-on-failure      # or ./build/unit_tests
 - [x] Phase 0: toolchain, ONNX Runtime, ResNet-18 export
 - [x] Phase 1: C++ inference matches PyTorch (CPU + CUDA)
 - [x] Phase 2: epoll HTTP server, unbatched baseline
-- [ ] Phase 3: request queue + dynamic batcher + worker completion path
-- [ ] Phase 4: memory pools, multiple executor workers
+- [x] Phase 3: request queue + dynamic batcher + worker completion path
+- [ ] Phase 4: memory pools (no per-request allocation on the hot path)
 - [ ] Phase 5: `/metrics` (Prometheus) and `/stats` (JSON)
 - [ ] Phase 6: load generator and benchmarks (batching on vs off)
 - [ ] Phase 7: Docker, CI, graceful shutdown
